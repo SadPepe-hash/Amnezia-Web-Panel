@@ -147,7 +147,8 @@
         font-size: 0.78rem;
     }
     .ssh-trust-btn { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
-    .ssh-trust-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex: 0 0 auto; }    .ssh-trust-btn.is-urgent { border-color: var(--warning); background: var(--warning-bg); color: var(--warning); }
+    .ssh-trust-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex: 0 0 auto; }
+    .ssh-trust-btn.is-urgent { border-color: var(--warning); background: var(--warning-bg); color: var(--warning); }
     .ssh-trust-dot.is-urgent { background: var(--warning); animation: sshTrustPulse 1.4s infinite; }
     .ssh-trust-btn.is-danger { border-color: var(--danger); background: var(--danger-bg); color: var(--danger); font-weight: 700; box-shadow: 0 0 0 3px rgba(239, 68, 68, .12); }
     .ssh-trust-dot.is-danger { background: var(--danger); animation: sshTrustPulse .9s infinite; }
@@ -4901,7 +4902,7 @@
                 const ipHtml = peerIp ? ` <span class="client-ip">${escapeHtml(peerIp)}</span>` : '';
                 const endpoint = (userData.endpoint || '').trim();
                 const endpointHtml = endpoint
-                    ? ` <span class="client-endpoint" title="${escapeHtml(_('peer_endpoint'))}">🌐 ${escapeHtml(endpoint)}</span>`
+                    ? ` <span class="client-endpoint" title="${escapeHtml(_('peer_endpoint'))}">🌐&nbsp;${escapeHtml(endpoint)}</span>`
                     : '';
 
                 let metaHtml = '';
@@ -5668,10 +5669,39 @@
 
     async function removeServer() {
         if (!confirm("Are you sure you want to remove this server from the panel? (The server itself will not be erased).")) return;
+        const base = `/api/servers/${SERVER_ID}/delete?server_uid=${encodeURIComponent(document.body.dataset.serverUid || '')}`;
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/delete?server_uid=${encodeURIComponent(document.body.dataset.serverUid || '')}`, 'POST');
+            const res = await apiCall(base, 'POST');
+            if (res && res.archived) {
+                showToast(_('delete_server_archived').replace('{count}', res.archived), 'success');
+            }
             window.location.href = '/';
         } catch (err) {
+            const payload = err.payload || {};
+            if (payload.code === 'traffic_finalization_required'
+                    && Array.isArray(payload.blocking) && payload.blocking.length) {
+                const details = payload.blocking
+                    .map(b => `• ${b.user_id || '?'} / ${b.protocol || '?'} / ${b.client_id || '?'}`)
+                    .join('\n');
+                const message = _('delete_server_blocked_confirm').replace('{count}', payload.blocking.length)
+                    + '\n\n' + details;
+                if (!confirm(message)) return;
+                try {
+                    const res = await apiCall(base + '&archive_blocking=true', 'POST');
+                    if (res && res.archived) {
+                        showToast(_('delete_server_archived').replace('{count}', res.archived), 'success');
+                    }
+                    window.location.href = '/';
+                } catch (retryErr) {
+                    const extra = retryErr.payload || {};
+                    if (extra.code === 'blocked_peer_still_active') {
+                        showToast(_('delete_server_blocked_still_active'), 'error');
+                    } else {
+                        showToast('Error: ' + retryErr.message, 'error');
+                    }
+                }
+                return;
+            }
             showToast('Error: ' + err.message, 'error');
         }
     }
