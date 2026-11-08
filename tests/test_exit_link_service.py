@@ -182,7 +182,7 @@ class Harness:
             exit_manager_factory=lambda host: self.exits.setdefault(host, FakeExit(host, self.events)),
             protocol_base=protocol_base,
             awg_protocols=AWG_PROTOCOLS,
-            protocol_display_name=lambda p: {'awg2': 'AmneziaWG 2.0'}.get(p, p),
+            protocol_display_name=lambda p, *metadata: {'awg2': 'AmneziaWG 2.0'}.get(p, p),
             find_server_by_uid=find_server_by_uid,
             sleep=sleep,
             time_fn=lambda: self.now,
@@ -228,6 +228,21 @@ class LinkTests(unittest.TestCase):
         self.assertNotIn('psk', saved)
         self.assertEqual(result['warnings'], [])
         self.assertFalse(result['ipv6_refused'])
+
+    def test_relink_keeps_smart_route_preferences(self):
+        h = Harness()
+        h.data['servers'][0]['protocols']['awg2']['exit_link'] = {
+            'exit_uid': 'exit-a',
+            'dns_via_exit': False,
+            'smart_route': True,
+            'smart_route_lost': False,
+            'smart_route_prev_dns': '9.9.9.9',
+        }
+        run(h.service.link(0, 'awg2', 'exit-a'))
+        saved = h.record()['exit_link']
+        self.assertTrue(saved['smart_route'])
+        self.assertFalse(saved['smart_route_lost'])
+        self.assertEqual(saved['smart_route_prev_dns'], '9.9.9.9')
 
     def test_validation_errors(self):
         h = Harness()

@@ -321,7 +321,9 @@ class ExitLinkService:
                                               lambda r: (r.get('exit_link') or {}).__setitem__('stale', reason))
                 return False
 
-            name = f"{entry.get('name') or entry.get('host', '')} / {self.protocol_display_name(protocol)}"
+            record = (entry.get('protocols') or {}).get(protocol, {})
+            label = self.protocol_display_name(protocol, record.get('header_protection'), record.get('protocol_version'))
+            name = f"{entry.get('name') or entry.get('host', '')} / {label}"
             peer = await asyncio.to_thread(exit_manager.add_peer, peer_id, name, entry_pub)
             link = {
                 'exit_uid': exit_uid,
@@ -374,6 +376,12 @@ class ExitLinkService:
                 'linked_at': datetime.now().isoformat(),
                 'stale': None,
             }
+            # Smart Route preferences live inside exit_link. A relink replaces
+            # that record; dropping them silently disables an already split
+            # instance while the host marker keeps applying throw routes.
+            for key in ('smart_route', 'smart_route_lost', 'smart_route_prev_dns'):
+                if key in previous:
+                    record[key] = previous[key]
             try:
                 await self._record_link(entry, exit_srv, protocol, record, source=source)
             except Exception:

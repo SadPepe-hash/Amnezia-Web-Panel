@@ -46,7 +46,9 @@ except ImportError:
 
 from managers.ssh_manager import SSHManager
 from managers import ssh_trust
+from managers import split_tunnel
 from managers.awg_manager import AWGManager, normalize_special_junk
+from server_stats import collect_host_stats
 from managers.awg_plugin_updater import (
     COMPONENTS as AWG_PLUGIN_COMPONENTS,
     KERNEL_MODULE as AWG_PLUGIN_KERNEL,
@@ -70,6 +72,7 @@ from mail_service import (
     MailService,
     merge_mail_settings,
 )
+from protocol_names import protocol_display_name, server_protocol_names
 from pwa import build_manifest
 from captcha_challenges import captcha_challenges
 from user_state import reconcile_user_state, apply_traffic_samples, traffic_server_identity
@@ -180,7 +183,25 @@ async def docs_auth_middleware(request, call_next):
         return RedirectResponse('/login')
     return await call_next(request)
 
-# Sessions must wrap every other middleware: docs_auth_middleware above
+@app.middleware("http")
+async def api_auth_status_middleware(request, call_next):
+    """Distinguish expired browser sessions from authenticated API denials.
+
+    Public login/share flows and Bearer integrations keep their own status
+    contracts. Only a denied panel API request with no valid browser user is
+    normalized; successful/public responses are never gated here.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if (response.status_code == 403 and path.startswith('/api/')
+            and not path.startswith(('/api/auth/', '/api/share/'))
+            and not request.headers.get('authorization', '').lower().startswith('bearer ')
+            and get_current_user(request) is None):
+        return JSONResponse({'error': 'Session expired'}, status_code=401)
+    return response
+
+
+# Sessions must wrap every other middleware: the auth middleware above
 # reads request.session, so SessionMiddleware has to sit outside it.
 app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
 
@@ -216,7 +237,9 @@ DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
 ssh_trust.configure(DATA_FILE)
-CURRENT_VERSION = "v1.8.5"
+# Client configs read the bypass list from whatever DATA_FILE is at call time.
+split_tunnel.configure(lambda: DATA_FILE)
+CURRENT_VERSION = "v1.8.7"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -348,6 +371,11 @@ def load_data():
     mail = settings.setdefault('mail', dict(DEFAULT_MAIL_SETTINGS))
     for key, value in DEFAULT_MAIL_SETTINGS.items():
         mail.setdefault(key, value)
+    # Imported here so isolated handler/AST tests can run load_data on its own.
+    from managers.split_tunnel import default_settings as split_tunnel_defaults
+    bypass = settings.setdefault('split_tunnel', split_tunnel_defaults())
+    for key, value in split_tunnel_defaults().items():
+        bypass.setdefault(key, value)
     settings.setdefault('ssl', {
         'enabled': False,
         'domain': '',
@@ -1154,36 +1182,8 @@ def next_protocol_key(protocols: dict, base: str) -> str:
     return protocol_key(base, idx)
 
 
-# The official Amnezia client has no separate AWG 3 container: it installs
-# AWG 3.x into amnezia-awg2 and only the config (HeaderProtectionKey) differs.
-AWG3_IN_AWG2_NAME = 'AmneziaWG 3 (amnezia-awg2)'
-
-
 def is_awg3_in_awg2(protocol: str, header_protection=False) -> bool:
     return protocol_base(protocol) == 'awg2' and bool(header_protection)
-
-
-def protocol_display_name(protocol: str, header_protection=False) -> str:
-    base = protocol_base(protocol)
-    idx = protocol_instance(protocol)
-    if is_awg3_in_awg2(protocol, header_protection):
-        return AWG3_IN_AWG2_NAME if idx <= 1 else f'{AWG3_IN_AWG2_NAME} #{idx}'
-    names = {
-        'awg': 'AmneziaWG',
-        'awg2': 'AmneziaWG 2.0',
-        'awg3': 'AmneziaWG 3.1',
-        'awg_legacy': 'AmneziaWG Legacy',
-        'xray': 'Xray',
-        'telemt': 'Telemt',
-        'dns': 'AmneziaDNS',
-        'wireguard': 'WireGuard',
-        'socks5': 'SOCKS5',
-        'adguard': 'AdGuard Home',
-        'nginx': 'NGINX',
-        'exit': 'Exit Node',
-    }
-    name = names.get(base, base)
-    return name if idx <= 1 else f'{name} #{idx}'
 
 
 def protocol_container_name(protocol: str) -> Optional[str]:
@@ -1376,11 +1376,13 @@ AWG_CONFIG_KEYS = (
 )
 
 
-def protocol_short_name(protocol: str, header_protection=False) -> str:
+def protocol_short_name(protocol: str, header_protection=False, protocol_version=None) -> str:
     """Short protocol tag for the server name, e.g. `AWG3`."""
     base = protocol_base(protocol)
     idx = protocol_instance(protocol)
-    if is_awg3_in_awg2(protocol, header_protection):
+    if base == 'awg2' and protocol_version == '3.1':
+        return 'AWG3.1' if idx <= 1 else f'AWG3.1#{idx}'
+    if base == 'awg2' and (protocol_version == '3.x' or (protocol_version is None and header_protection)):
         base = 'awg3'
     names = {
         'awg': 'AWG',
@@ -1404,7 +1406,7 @@ def connection_display_name(server=None, protocol=None) -> str:
     """`<node> <container>`, e.g. `nl-01 AWG3` -- the name the client will show."""
     node = str((server or {}).get('name') or (server or {}).get('host') or '').strip()
     record = ((server or {}).get('protocols') or {}).get(protocol) or {} if protocol else {}
-    tag = protocol_short_name(protocol, record.get('header_protection')) if protocol else ''
+    tag = protocol_short_name(protocol, record.get('header_protection'), record.get('protocol_version')) if protocol else ''
     return ' '.join(part for part in (node, tag) if part)
 
 
@@ -2295,6 +2297,11 @@ def tpl(request, template, **kwargs):
         'request': request,
         'static_v': static_version(),
         'current_user': get_current_user(request),
+        'protocol_display_name': protocol_display_name,
+        'server_protocol_names': server_protocol_names,
+        'server_protocol_labels': [server_protocol_names(s) for s in kwargs.get('servers', [])],
+        'default_protocol_labels': {p: protocol_display_name(p) for p in BASE_PROTOCOLS},
+        'protocol_short_name': protocol_short_name,
         'site_settings': data.get('settings', {}).get('appearance', {}),
         'captcha_settings': data.get('settings', {}).get('captcha', {}),
         'telegram_settings': data.get('settings', {}).get('telegram', {}),
@@ -2935,6 +2942,9 @@ async def startup():
     asyncio.create_task(restore_public_port_forwards())
     # ... and keep re-applying: a VPS can reboot while the panel keeps running.
     asyncio.create_task(restore_public_port_forwards_loop())
+    # One-shot: old RKN installs have no [Install] in the unit and lose their
+    # rules at reboot. Runs in the background, never blocks startup.
+    asyncio.create_task(rkn_boot_restore_migration())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
@@ -4197,51 +4207,7 @@ def api_server_stats(request: Request, server_id: int):
         server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
-        stats = {}
-        out, _, _ = ssh.run_command(
-            "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || "
-            "awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){pu=u;pt=t} else printf \"%.1f\", (u-pu)/(t-pt)*100}' "
-            "<(grep 'cpu ' /proc/stat) <(sleep 0.5 && grep 'cpu ' /proc/stat) 2>/dev/null"
-        )
-        try:
-            stats['cpu'] = round(float(out.strip().split('\n')[0]), 1)
-        except (ValueError, IndexError):
-            stats['cpu'] = 0
-        out, _, _ = ssh.run_command("free -b | awk 'NR==2{printf \"%d %d\", $3, $2}'")
-        try:
-            parts = out.strip().split()
-            used, total = int(parts[0]), int(parts[1])
-            stats.update(ram_used=used, ram_total=total, ram_percent=round(used / total * 100, 1) if total > 0 else 0)
-        except (ValueError, IndexError):
-            stats.update(ram_used=0, ram_total=0, ram_percent=0)
-        out, _, _ = ssh.run_command("df -B1 / | awk 'NR==2{printf \"%d %d\", $3, $2}'")
-        try:
-            parts = out.strip().split()
-            used, total = int(parts[0]), int(parts[1])
-            stats.update(disk_used=used, disk_total=total, disk_percent=round(used / total * 100, 1) if total > 0 else 0)
-        except (ValueError, IndexError):
-            stats.update(disk_used=0, disk_total=0, disk_percent=0)
-        out, _, _ = ssh.run_command(
-            "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
-            "cat /proc/net/dev | awk -v dev=\"$DEV:\" '$1==dev{printf \"%d %d\", $2, $10}'"
-        )
-        try:
-            parts = out.strip().split()
-            stats['net_rx'], stats['net_tx'] = int(parts[0]), int(parts[1])
-        except (ValueError, IndexError):
-            stats['net_rx'] = stats['net_tx'] = 0
-        out, _, _ = ssh.run_command("uptime -p 2>/dev/null || uptime")
-        stats['uptime'] = out.strip()
-        # Global IPv6 addresses for the page header. Some providers mark ULA
-        # (fd00::/8) addresses as scope global, so filter them out explicitly.
-        # Small point-to-point transit prefixes (/126 etc. between the box and
-        # the provider's router) are infrastructure, not a public address.
-        out, _, _ = ssh.run_command(
-            "ip -6 addr show scope global 2>/dev/null | "
-            "awk '/inet6/ && $2 !~ /^fd[0-9a-fA-F]{2}:/ {"
-            "split($2, a, \"/\"); if (a[2] <= 64) print a[1]}'"
-        )
-        stats['ipv6'] = [a for a in (line.strip() for line in out.splitlines()) if a]
+        stats = collect_host_stats(ssh)
         ssh.disconnect()
         return stats
     except Exception as e:
@@ -4260,6 +4226,47 @@ RKN_INSTALL_CMD = (
 )
 
 RKN_SCRIPT_URL = f'{RKN_RAW_BASE}/rkn-extra-block.sh'
+
+# Repair ships the files bundled with this panel checkout, not a GitHub fetch:
+# a host whose boot restore is broken may also be unable to reach the internet.
+RKN_BLOCK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'scripts', 'rknblock')
+RKN_REPAIR_FILES = (
+    ('rkn-extra-block.sh', '/usr/local/sbin/rkn-extra-block', '0755'),
+    ('rkn-extra-block.service', '/etc/systemd/system/rkn-extra-block.service', '0644'),
+    ('rkn-extra-block.timer', '/etc/systemd/system/rkn-extra-block.timer', '0644'),
+)
+
+
+def _rkn_repair_script():
+    """Remote script: back up, install bundled units/script, enable, restore.
+
+    Files are embedded as base64 so the same payload works over both root and
+    sudo SSH (run_sudo_script) without extra SFTP privileges for /etc.
+    """
+    payload = []
+    for name, dest, mode in RKN_REPAIR_FILES:
+        with open(os.path.join(RKN_BLOCK_DIR, name), 'r', encoding='utf-8') as fh:
+            content = fh.read().replace('\r\n', '\n')
+        encoded = base64.b64encode(content.encode('utf-8')).decode('ascii')
+        payload.append(f"printf '%s' '{encoded}' | base64 -d > '{dest}.amnezia-tmp'")
+        payload.append(f"chmod {mode} '{dest}.amnezia-tmp'")
+        payload.append(f"mv -f '{dest}.amnezia-tmp' '{dest}'")
+    install = '\n'.join(payload)
+    return f"""set -eu
+ts=$(date -u +%Y%m%d-%H%M%S)
+bak="/root/backups-rkn-repair-$ts"
+mkdir -p "$bak"
+for f in /usr/local/sbin/rkn-extra-block /etc/systemd/system/rkn-extra-block.service /etc/systemd/system/rkn-extra-block.timer; do
+    if [ -f "$f" ]; then cp -a "$f" "$bak"/; fi
+done
+{install}
+systemctl daemon-reload
+systemctl enable rkn-extra-block.timer
+systemctl enable --now rkn-extra-block.timer
+systemctl enable rkn-extra-block.service
+/usr/local/sbin/rkn-extra-block repair
+"""
 
 
 def _rkn_run_cmd(subcommand):
@@ -4459,6 +4466,79 @@ async def api_rknblock_update(request: Request, server_id: int, server_uid: str 
     return {'status': 'success', 'updated': True}
 
 
+def _rkn_status_after_repair(out, installed=True):
+    """Parse a post-repair probe and derive the boot fields the UI needs."""
+    parsed = _parse_rkn_scan_output(out, installed)
+    parsed['boot_enabled'] = parsed.get('boot_restore') == 'enabled'
+    parsed['repair_available'] = bool(
+        installed and (not parsed['boot_enabled'] or parsed.get('unit') == 'legacy'))
+    return parsed
+
+
+@app.post('/api/servers/{server_id}/rknblock/repair', tags=["Servers"])
+@serialize_peer_lifecycle
+async def api_rknblock_repair(request: Request, server_id: int, server_uid: str | None = None):
+    """Restore boot restore on a host: bundled units/script, enable, rules.
+
+    Idempotent. Only touches rkn-extra-block files and systemd state; VPN
+    containers, docker and data.json secrets are left alone.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    server_id = _rkn_server_index(data, server_id, server_uid)
+    if server_id is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = dict(data['servers'][server_id])
+    if not _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    server_uid = server.get('uid')
+
+    try:
+        script = _rkn_repair_script()
+    except OSError as e:
+        logger.error(f"RKN repair payload unavailable: {e}")
+        return JSONResponse({'error': f'repair payload unavailable: {e}'},
+                            status_code=500)
+    err = await _rkn_ssh_run(server, script, 300)
+    now = datetime.now(timezone.utc).isoformat()
+    if err is not None:
+        detail = ''
+        try:
+            detail = json.loads(err.body).get('error', '')[:500]
+        except Exception:
+            pass
+
+        def mark_fail(rec):
+            rec['last_repair_at'] = now
+            rec['last_repair_error'] = detail or 'repair failed'
+
+        await _rkn_store_record(server_id, server_uid, mark_fail, server)
+        RKN_FLAG_CACHE.pop(server_id, None)
+        return err
+
+    out = ''
+    try:
+        out = await _fetch_rkn_scan_output(server)
+    except Exception as e:
+        logger.warning(f"RKN repair status probe failed on {server.get('host')}: {e}")
+    parsed = _rkn_status_after_repair(out, True)
+
+    def mark(rec):
+        rec['boot_restore'] = parsed.get('boot_restore') or 'unknown'
+        rec['last_repair_at'] = now
+        rec['last_repair_error'] = None
+
+    rec = await _rkn_store_record(server_id, server_uid, mark, server)
+    if rec is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    parsed['status'] = 'success'
+    parsed['last_repair_at'] = now
+    parsed['last_repair_error'] = None
+    return parsed
+
+
 RKN_OPTION_FLAGS = ('block_in', 'block_out', 'log_in', 'log_out')
 
 
@@ -4501,7 +4581,7 @@ async def api_rknblock_options(request: Request, server_id: int, req: RknBlockOp
     return {'status': 'success', 'flags': values}
 
 
-RKN_SCAN_SSH_CMD = ("rkn-extra-block status 2>/dev/null | head -10; "
+RKN_SCAN_SSH_CMD = ("rkn-extra-block status 2>/dev/null | head -30; "
                       "echo '===LOG==='; tail -n 2000 /var/log/rkn-scans.json 2>/dev/null")
 
 
@@ -4539,6 +4619,17 @@ def _parse_rkn_scan_output(out, flag_enabled):
     m = re.search(r'health:\s*(\w+)', status_part)
     if m:
         health = m.group(1).lower()
+    # boot_restore: enabled|disabled|unknown — will systemd run `boot` after a
+    # reboot. unit: ok when the service file carries [Install], legacy for the
+    # 2026-10 installs whose unit had none (is-enabled=static -> disabled).
+    boot_restore = None
+    m = re.search(r'boot_restore:\s*(\w+)', status_part)
+    if m:
+        boot_restore = m.group(1).lower()
+    unit = None
+    m = re.search(r'unit:\s*(\w+)', status_part)
+    if m:
+        unit = m.group(1).lower()
     events = []
     for line in (log_part or '').splitlines():
         line = line.strip()
@@ -4585,6 +4676,8 @@ def _parse_rkn_scan_output(out, flag_enabled):
         'flag_enabled': bool(flag_enabled),
         'agent_state': agent_state,
         'health': health,
+        'boot_restore': boot_restore,
+        'unit': unit,
         'sets_ok': sets_ok,
         'problems': problems,
         'sets': sets,
@@ -4657,6 +4750,13 @@ async def api_rkn_scans(request: Request, server_id: int, server_uid: str | None
                              and parsed.get('sets_ok')
                              and parsed.get('health') != 'failed')
     parsed['last_error'] = record.get('last_error')
+    # Older scripts do not print boot_restore/unit at all: absence of the lines
+    # is itself a signal to offer the repair (the host predates the fix).
+    boot_enabled = parsed.get('boot_restore') == 'enabled'
+    parsed['boot_enabled'] = bool(installed and boot_enabled)
+    parsed['repair_available'] = bool(
+        installed and available and parsed.get('agent_state') in ('on', 'off')
+        and (not boot_enabled or parsed.get('unit') == 'legacy'))
     return parsed
 
 
@@ -4726,6 +4826,127 @@ async def api_rkn_scan_flags(request: Request):
     return {str(i): s for i, s in results if s}
 
 
+# --- one-shot boot-restore migration ----------------------------------------
+# Hosts installed before the unit gained [Install] report is-enabled=static and
+# never run `boot`, so their iptables rules vanish at reboot. New installs are
+# already correct; this runs once after a panel upgrade and repairs the old
+# ones without apt, VPN reinstall or manual steps.
+RKN_AUTO_REPAIR = os.environ.get('RKN_AUTO_REPAIR', '1').lower() not in (
+    '0', 'false', 'no', 'off')
+RKN_AUTO_REPAIR_DELAY = 15  # let the panel start serving first; tests patch to 0
+RKN_AUTO_REPAIR_TIMEOUT = 300
+RKN_MIGRATION_KEY = 'rkn_boot_restore_v1'
+
+
+def _rkn_migration_record(data):
+    return (data.setdefault('panel_migrations', {})
+            .setdefault(RKN_MIGRATION_KEY, {}))
+
+
+async def _rkn_note_boot_state(uid, boot_restore, error=None):
+    """Persist only boot/repair fields of one server's rknblock record."""
+    async with DATA_LOCK:
+        data = load_data()
+        idx = _rkn_server_index(data, None, uid)
+        if idx is None:
+            return False
+        rec = dict(data['servers'][idx].get('rknblock') or {})
+        if boot_restore is not None:
+            rec['boot_restore'] = boot_restore
+        if error is not None:
+            rec['last_repair_error'] = error
+        elif error is None and boot_restore == 'enabled':
+            rec['last_repair_error'] = None
+        data['servers'][idx]['rknblock'] = rec
+        save_data(data)
+        return True
+
+
+async def rkn_boot_restore_migration():
+    """Repair legacy RKN installs once, after the panel has started.
+
+    Never raises: one unreachable host must not affect the others or the
+    panel. A failed host leaves the migration incomplete, so the next panel
+    restart retries it; fixed hosts are skipped by the status probe.
+    """
+    if not RKN_AUTO_REPAIR:
+        logger.info("RKN boot-restore migration disabled by RKN_AUTO_REPAIR")
+        return
+    await asyncio.sleep(RKN_AUTO_REPAIR_DELAY)
+    try:
+        data = load_data()
+    except Exception as e:
+        logger.warning(f"RKN boot-restore migration: cannot read data: {e}")
+        return
+    if _rkn_migration_record(data).get('done_at'):
+        return
+    targets = [srv for srv in data.get('servers', [])
+               if (srv.get('rknblock') or {}).get('installed')]
+    if not targets:
+        await _rkn_migration_finish(0)
+        return
+
+    pending = 0
+    for srv in targets:
+        uid = srv.get('uid')
+        label = srv.get('name') or srv.get('host') or uid
+        try:
+            out = await _fetch_rkn_scan_output(srv)
+            parsed = _parse_rkn_scan_output(out, True)
+            boot = parsed.get('boot_restore')
+            unit = parsed.get('unit')
+            if boot is None or unit is None:
+                # Old script (no status fields) or an empty probe: repair is
+                # still safe and installs the current script first.
+                if not out.strip():
+                    raise RuntimeError('empty status probe')
+            if boot == 'enabled' and unit == 'ok':
+                await _rkn_note_boot_state(uid, 'enabled')
+                continue
+
+            err = await _rkn_ssh_run(srv, _rkn_repair_script(), RKN_AUTO_REPAIR_TIMEOUT)
+            if err is not None:
+                detail = 'repair failed'
+                try:
+                    detail = json.loads(err.body).get('error', detail)[:500]
+                except Exception:
+                    pass
+                await _rkn_note_boot_state(uid, boot or 'unknown', detail)
+                logger.warning(f"RKN boot-restore repair failed on {label}: {detail}")
+                pending += 1
+                continue
+
+            out = await _fetch_rkn_scan_output(srv)
+            parsed = _parse_rkn_scan_output(out, True)
+            boot = parsed.get('boot_restore') or 'unknown'
+            await _rkn_note_boot_state(uid, boot)
+            if boot != 'enabled':
+                pending += 1
+                logger.warning(f"RKN boot-restore still not enabled on {label}")
+            else:
+                logger.info(f"RKN boot-restore repaired on {label}")
+        except Exception as e:
+            pending += 1
+            try:
+                await _rkn_note_boot_state(uid, None, str(e)[:500])
+            except Exception:
+                pass
+            logger.warning(f"RKN boot-restore migration failed on {label}: {e}")
+
+    await _rkn_migration_finish(pending)
+
+
+async def _rkn_migration_finish(pending):
+    async with DATA_LOCK:
+        data = load_data()
+        rec = _rkn_migration_record(data)
+        rec['last_attempt_at'] = datetime.now(timezone.utc).isoformat()
+        rec['pending'] = pending
+        if pending == 0:
+            rec['done_at'] = rec['last_attempt_at']
+        save_data(data)
+
+
 @app.post('/api/servers/{server_id}/check', tags=["Servers"])
 def api_check_server(request: Request, server_id: int):
     if not _check_admin(request):
@@ -4763,9 +4984,14 @@ def api_check_server(request: Request, server_id: int):
                 merged['awg_params'] = db_proto.get('awg_params')
             merged['base_protocol'] = db_proto.get('base_protocol') or protocol_base(proto)
             merged['instance'] = db_proto.get('instance') or protocol_instance(proto)
-            merged['display_name'] = db_proto.get('display_name') or protocol_display_name(proto)
-            if protocol_base(proto) == 'awg2' and 'header_protection' in merged:
-                merged['display_name'] = protocol_display_name(proto, merged['header_protection'])
+            if 'protocol_version' not in merged:
+                # An explicit legacy result clears 3.x; a partial modern
+                # response retains the last detected minor version.
+                merged['protocol_version'] = ('2.0' if merged.get('header_protection') is False
+                                              else db_proto.get('protocol_version'))
+            merged['display_name'] = protocol_display_name(
+                proto, merged.get('header_protection', db_proto.get('header_protection')),
+                merged.get('protocol_version'))
             merged['container_name'] = db_proto.get('container_name') or protocol_container_name(proto)
             if protocol_base(proto) == 'adguard':
                 for key in ('web_port', 'mode', 'internal_ip', 'expose_web'):
@@ -4850,7 +5076,7 @@ def api_check_server(request: Request, server_id: int):
                         'awg_params': result.get('awg_params', {}),
                         'base_protocol': protocol_base(proto),
                         'instance': protocol_instance(proto),
-                        'display_name': protocol_display_name(proto, result.get('header_protection')),
+                        'display_name': protocol_display_name(proto, result.get('header_protection'), result.get('protocol_version')),
                         'container_name': protocol_container_name(proto),
                     }
                     if protocol_base(proto) == 'adguard':
@@ -4876,9 +5102,14 @@ def api_check_server(request: Request, server_id: int):
                 record = server['protocols'][proto]
                 if protocol_base(proto) == 'awg2' and 'header_protection' in result:
                     header_protection = bool(result['header_protection'])
-                    if bool(record.get('header_protection')) != header_protection:
+                    name = protocol_display_name(proto, header_protection, result.get('protocol_version'))
+                    if (bool(record.get('header_protection')) != header_protection
+                            or record.get('display_name') != name
+                            or ('protocol_version' in result and record.get('protocol_version') != result['protocol_version'])):
                         record['header_protection'] = header_protection
-                        record['display_name'] = protocol_display_name(proto, header_protection)
+                        record['display_name'] = name
+                        if 'protocol_version' in result:
+                            record['protocol_version'] = result['protocol_version']
                         changed = True
             else:
                 if proto in server['protocols']:
@@ -6903,7 +7134,9 @@ def api_wgeasy_import(request: Request, server_id: int, req: WgEasyImportRequest
             'awg_params': {},
             'base_protocol': protocol_base(target),
             'instance': protocol_instance(target),
-            'display_name': protocol_display_name(target),
+            # wg-easy imports only AWG 2.0 parameters, not 3.x config keys.
+            'protocol_version': '2.0' if protocol_base(target) == 'awg2' else None,
+            'display_name': protocol_display_name(target, protocol_version='2.0'),
             'container_name': protocol_container_name(target),
         }
         save_data(data)
@@ -7487,12 +7720,16 @@ def api_save_connection_config(request: Request, server_id: int, req: SaveConnec
             return JSONResponse({'error': 'Config is required'}, status_code=400)
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
+        # The editor shows the config with the bypass list expanded; store it
+        # folded so the client keeps following later changes to the list.
+        config_text = split_tunnel.fold_config(config_text)
         ssh = get_ssh(server)
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
         _manager_call(manager, 'save_client_config', req.protocol, req.client_id, config_text)
         ssh.disconnect()
-        return {'status': 'success', **config_payloads(config_text, server, req.protocol)}
+        shown = split_tunnel.apply_to_config(config_text)
+        return {'status': 'success', **config_payloads(shown, server, req.protocol)}
     except Exception as e:
         logger.exception("Error saving connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -8084,6 +8321,7 @@ def api_get_user_connections(request: Request, user_id: str):
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
             c['server_name'] = data['servers'][sid].get('name', '')
+            c['protocol_name'] = server_protocol_names(data['servers'][sid]).get(c.get('protocol', 'awg'), '')
 
     # Enrich with live peer data (IP, enabled, handshake, transfer, speed
     # limit) from each server the user has connections on. One SSH session
@@ -8142,9 +8380,13 @@ def api_my_connections(request: Request):
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
             c['server_name'] = data['servers'][sid].get('name', '')
+            c['protocol_name'] = server_protocol_names(data['servers'][sid]).get(c.get('protocol', 'awg'), '')
         else:
             c['server_name'] = 'Unknown'
-        c['protocol_name'] = protocol_display_name(c.get('protocol', ''))
+        record = {}
+        if 0 <= sid < len(data['servers']):
+            record = (data['servers'][sid].get('protocols') or {}).get(c.get('protocol')) or {}
+        c['protocol_name'] = protocol_display_name(c.get('protocol', ''), record.get('header_protection'), record.get('protocol_version'))
     return {'connections': conns}
 
 
@@ -8330,6 +8572,84 @@ def api_my_connection_config(request: Request, connection_id: str):
     except Exception as e:
         logger.exception("Error getting my connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+# ======================== SPLIT TUNNEL: NETWORKS OUTSIDE THE VPN ========================
+
+class SplitTunnelSaveRequest(BaseModel):
+    enabled: bool = False
+    networks: str = ''
+    source: str = 'manual'
+
+
+class SplitTunnelPublicRequest(BaseModel):
+    country: str = 'RU'
+    shorten: bool = True
+
+
+def _split_tunnel_error(exc: split_tunnel.SplitTunnelError):
+    status = 502 if exc.code == 'fetch_failed' else 400
+    return JSONResponse({'error': str(exc), 'code': exc.code, **exc.details}, status_code=status)
+
+
+@app.get('/api/settings/split-tunnel', tags=["Settings"])
+def api_split_tunnel_get(request: Request):
+    """The bypass list and what it costs a client (AllowedIPs entries)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    return split_tunnel.describe(load_data()['settings'].get('split_tunnel'))
+
+
+@app.post('/api/settings/split-tunnel', tags=["Settings"])
+def api_split_tunnel_save(request: Request, req: SplitTunnelSaveRequest):
+    """Store a typed or uploaded list and the on/off switch. Every WireGuard/
+    AmneziaWG config generated afterwards routes these networks outside the
+    tunnel; server-side peers are not touched."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        networks, invalid, ipv6_skipped = split_tunnel.parse_networks(req.networks)
+        if invalid:
+            return JSONResponse({'error': 'Invalid networks', 'code': 'invalid_networks',
+                                 'invalid': invalid[:20], 'invalid_count': len(invalid)},
+                                status_code=400)
+        data = load_data()
+        settings = data['settings']
+        current = settings.get('split_tunnel') or {}
+        networks = split_tunnel.normalize(networks)
+        if networks == list(current.get('networks') or []):
+            # Same list (a toggle, or a re-save): keep where it came from.
+            updated = {**current, 'enabled': bool(req.enabled)}
+        else:
+            source = req.source if req.source in ('manual', 'file') else 'manual'
+            updated = split_tunnel.settings_update(current, networks, source, enabled=req.enabled)
+        settings['split_tunnel'] = updated
+        save_data(data)
+    except split_tunnel.SplitTunnelError as exc:
+        return _split_tunnel_error(exc)
+    return {**split_tunnel.describe(updated), 'ipv6_skipped': ipv6_skipped}
+
+
+@app.post('/api/settings/split-tunnel/public', tags=["Settings"])
+def api_split_tunnel_public(request: Request, req: SplitTunnelPublicRequest):
+    """One click: fetch the country's networks from public registries
+    (RIPEstat, then ipdeny / country-ip-blocks), shorten them unless told
+    not to, store the list and switch it on."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        result = split_tunnel.build_public_list(req.country, shorten_list=req.shorten)
+        data = load_data()
+        settings = data['settings']
+        updated = split_tunnel.settings_update(
+            settings.get('split_tunnel'), result['networks'], result['source'],
+            source_detail=result['source_detail'], shortened=result['shortened'], enabled=True)
+        settings['split_tunnel'] = updated
+        save_data(data)
+    except split_tunnel.SplitTunnelError as exc:
+        return _split_tunnel_error(exc)
+    return {**split_tunnel.describe(updated), 'full_count': result['full_count'],
+            'unresolved_hosts': result['unresolved_hosts']}
 
 
 # ======================== EMAIL DELIVERY (admin) ========================

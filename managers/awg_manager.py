@@ -38,6 +38,7 @@ from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 from managers.clients_table import save_clients_table
+from managers import split_tunnel
 
 logger = logging.getLogger(__name__)
 
@@ -867,11 +868,12 @@ class AWGManager:
 
     def check_docker_installed(self):
         """Check if Docker is installed and running."""
-        out, err, code = self.ssh.run_command("docker --version 2>/dev/null")
-        if code != 0:
-            return False
-        out2, _, code2 = self.ssh.run_command("systemctl is-active docker 2>/dev/null || service docker status 2>/dev/null")
-        return 'active' in out2 or 'running' in out2.lower()
+        _, _, code = self.ssh.run_command(
+            "export LC_ALL=C; docker --version >/dev/null 2>&1 && "
+            "if command -v systemctl >/dev/null 2>&1; then "
+            "systemctl is-active --quiet docker; "
+            "else service docker status >/dev/null 2>&1; fi", timeout=30)
+        return code == 0
 
     def install_docker(self):
         """Install Docker on the server (mirrors install_docker.sh)."""
@@ -3749,7 +3751,7 @@ PersistentKeepalive = 25
             'client_name': client_name,
             'client_id': client_pub_key,
             'client_ip': client_ip,
-            'config': client_config,
+            'config': split_tunnel.apply_to_config(client_config),
         }
 
     def get_client_config(self, protocol_type, client_id, server_host, port, public_port=None):
@@ -3770,7 +3772,7 @@ PersistentKeepalive = 25
 
         ud = client.get('userData', {})
         if ud.get('customConfig'):
-            return ud['customConfig']
+            return split_tunnel.apply_to_config(ud['customConfig'])
         client_priv_key = ud.get('clientPrivateKey', '')
         client_ip = ud.get('clientIp', '')
         psk = ud.get('psk', '')
@@ -3845,7 +3847,7 @@ AllowedIPs = {peer_allowed_ips}
 Endpoint = {server_host}:{public_port or port}
 PersistentKeepalive = 25
 """
-        return config
+        return split_tunnel.apply_to_config(config)
 
     @_serialized_table_write
     def toggle_client(self, protocol_type, client_id, enable):
@@ -4431,6 +4433,17 @@ PersistentKeepalive = 25
                     # The official Amnezia client installs AWG 3.x into the
                     # amnezia-awg2 container, so only the config tells 2.0 and 3.x apart.
                     info['header_protection'] = bool(info['awg_params'].get('header_protection_key'))
+                    # HeaderProtectionKey alone only proves 3.x. RandomTrailers
+                    # and DisableCookies were added in 3.1; explicit "off" also
+                    # identifies that config format. Do not use the container
+                    # name or the tools/daemon build number as a protocol version.
+                    if any(str(info['awg_params'].get(key, '')).strip()
+                           for key in ('random_trailers', 'disable_cookies')):
+                        info['protocol_version'] = '3.1'
+                    elif info['header_protection']:
+                        info['protocol_version'] = '3.x'
+                    elif self._base_protocol(protocol_type) == self.AWG2:
+                        info['protocol_version'] = '2.0'
                     # Count ALL peers, not only clientsTable rows: peers that
                     # exist in awg0.conf but not in the table (shown as
                     # 'External' in the list) are still real connections.
