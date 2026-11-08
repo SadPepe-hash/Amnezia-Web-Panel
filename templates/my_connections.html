@@ -1,51 +1,95 @@
 {% extends "base.html" %}
 
 {% block title_extra %} — {{ _('my_connections_title') }}{% endblock %}
+{% block page_class %}page page--my-connections{% endblock %}
 
 {% block content %}
 <section>
-    <h1 class="section-title">
-        <span class="icon">🔗</span>
-        {{ _('my_connections_title') }}
-    </h1>
+    <div class="page-header">
+        <h1 class="section-title page-header__title">
+            <span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span>
+            {{ _('my_connections_title') }}
+        </h1>
 
-    {% if connections %}
-    <div class="clients-list" id="myConnectionsList">
-        {% for c in connections %}
-        <div class="client-item">
-            <div class="client-info">
-                <div class="client-avatar">🔗</div>
-                <div>
-                    <div class="client-name">{{ c.name or 'VPN Connection' }}</div>
-                    <div class="client-meta">
-                        <span>🖥 {{ c.server_name }}</span>
-                        <span class="badge badge-info" style="font-size:0.65rem;">
-                            {{ 'AmneziaWG' if c.protocol == 'awg' else ('AmneziaWG 2.0' if c.protocol == 'awg2' else ('AWG Legacy' if c.protocol == 'awg_legacy' else
-                            ('Xray' if c.protocol == 'xray' else c.protocol | upper))) }}
-                        </span>
-                        {% if c.created_at %}
-                        <span>📅 {{ c.created_at[:10] }}</span>
-                        {% endif %}
-                    </div>
-                </div>
-            </div>
-            <div class="client-actions">
-                <button class="btn btn-primary btn-sm"
-                    onclick="showMyConfig('{{ c.id }}', '{{ c.name or 'Connection' }}', '{{ c.protocol }}')">
-                    {{ _('show_config') }}
-                </button>
-            </div>
+        <div id="selfServiceControls" class="page-header__actions hidden">
+            <span id="connectionsCounter" class="badge badge-info" style="font-size:0.85rem;"></span>
+            <button class="btn btn-primary" onclick="openCreateConnectionModal()">
+                <span>＋</span> {{ _('create_connection') }}
+            </button>
         </div>
-        {% endfor %}
     </div>
-    {% else %}
-    <div class="empty-state">
+
+    <div id="selfServiceDisabledMsg" class="hidden" style="margin-bottom:var(--space-lg);">
+        <div class="card" style="padding:var(--space-lg); text-align:center; color:var(--text-muted);">
+            {{ _('self_service_disabled') }}
+        </div>
+    </div>
+
+    <div id="connectionsContainer" class="hidden">
+        <div id="connectionsGrid" class="cards-grid-2">
+            <!-- Connections will be loaded here via JS -->
+        </div>
+    </div>
+
+    <div id="connectionsLoading" style="text-align: center; padding: 4rem;">
+        <div class="spinner" style="width: 40px; height: 40px; margin: 0 auto;"></div>
+        <p style="margin-top: 1rem; color: var(--text-muted);">{{ _('loading_connections') }}</p>
+    </div>
+
+    <div id="connectionsEmpty" class="empty-state hidden">
+        <div class="empty-icon">🔗</div>
+        <div class="empty-title">{{ _('nothing_found') }}</div>
+        <div class="empty-desc">{{ _('search_empty_desc') }}</div>
+    </div>
+
+    <div id="noConnectionsState" class="empty-state hidden">
         <div class="empty-icon">🔗</div>
         <div class="empty-title">{{ _('no_connections') }}</div>
         <div class="empty-desc">{{ _('no_connections_user_desc') }}</div>
     </div>
-    {% endif %}
 </section>
+
+<!-- ===== Create Connection Modal ===== -->
+<div class="modal-backdrop" id="createConnectionModal">
+    <div class="modal" style="max-width: 460px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _('create_connection') }}</h2>
+            <button class="modal-close" onclick="closeModal('createConnectionModal')">×</button>
+        </div>
+
+        <form id="createConnectionForm" onsubmit="return submitCreateConnection(event)">
+            <div class="form-group">
+                <label class="form-label">{{ _('server_label') }}</label>
+                <select class="form-select" id="createConnServer" onchange="updateCreateConnProtocols()">
+                    <option value="" disabled selected>{{ _('loading') }}</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">{{ _('protocol_label') }}</label>
+                <select class="form-select" id="createConnProtocol">
+                    <option value="" disabled selected>{{ _('loading') }}</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">{{ _('device_name') }}</label>
+                <input class="form-input" type="text" id="createConnName"
+                    placeholder="{{ _('connection_name_placeholder') }}" maxlength="100" required>
+            </div>
+
+            <div id="createConnectionError" style="color: var(--danger, #ef4444); font-size: 0.85rem; margin-bottom: var(--space-sm);"></div>
+
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('createConnectionModal')">{{ _('cancel') }}</button>
+                <button type="submit" class="btn btn-primary" id="createConnBtn">
+                    <span id="createConnBtnText">{{ _('create') }}</span>
+                    <div class="spinner hidden" id="createConnSpinner"></div>
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
 
 <!-- ===== Config Modal ===== -->
 <div class="modal-backdrop" id="configModal">
@@ -90,8 +134,15 @@
 
         <div class="config-panel" id="panel-qr">
             <div class="qr-container">
+                <div class="qr-format hidden" id="qrFormat">
+                    <button type="button" class="qr-format-btn active" data-fmt="amnezia"
+                        onclick="setQrFormat('amnezia')">{{ _('qr_format_amnezia') }}</button>
+                    <button type="button" class="qr-format-btn" data-fmt="wireguard"
+                        onclick="setQrFormat('wireguard')">{{ _('qr_format_wireguard') }}</button>
+                </div>
                 <div id="qrCode"></div>
                 <div class="qr-hint">{{ _('qr_hint') }}</div>
+                <div class="qr-hint" id="qrFormatHint"></div>
             </div>
         </div>
     </div>
@@ -103,6 +154,233 @@
     let currentConfig = '';
     let currentVpnLink = '';
     let currentConfigName = 'connection';
+    let ssOptions = null;
+    let allConnections = [];
+
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+    }
+
+    function escapeJs(value) {
+        return String(value ?? '').replace(/[\\'"\n\r<>]/g, ch => ({
+            '\\': '\\\\', "'": "\\'", '"': '\\"', '\n': '\\n', '\r': '\\r', '<': '\\x3c', '>': '\\x3e'
+        }[ch]));
+    }
+
+    function getProtocolLabel(proto, protocolName) {
+        if (protocolName) {
+            return protocolName;
+        }
+        return String(proto || '').split('__', 1)[0].toUpperCase() || '—';
+    }
+
+    async function loadConnections() {
+        const loading = document.getElementById('connectionsLoading');
+        const container = document.getElementById('connectionsContainer');
+        const empty = document.getElementById('connectionsEmpty');
+        const noConn = document.getElementById('noConnectionsState');
+
+        loading.classList.remove('hidden');
+        container.classList.add('hidden');
+        empty.classList.add('hidden');
+        noConn.classList.add('hidden');
+
+        try {
+            const data = await apiCall('/api/my/connections');
+            allConnections = data.connections || [];
+            loading.classList.add('hidden');
+            renderConnections();
+        } catch (err) {
+            loading.classList.add('hidden');
+            showToast(`${_('error')}: ` + err.message, 'error');
+        }
+    }
+
+    function renderConnections() {
+        const container = document.getElementById('connectionsContainer');
+        const grid = document.getElementById('connectionsGrid');
+        const empty = document.getElementById('connectionsEmpty');
+        const noConn = document.getElementById('noConnectionsState');
+
+        if (allConnections.length === 0) {
+            container.classList.add('hidden');
+            noConn.classList.remove('hidden');
+            empty.classList.add('hidden');
+            return;
+        }
+
+        container.classList.remove('hidden');
+        noConn.classList.add('hidden');
+        empty.classList.add('hidden');
+
+        grid.innerHTML = allConnections.map(c => `
+            <div class="client-item entity-card connection-card">
+                <div class="client-avatar">🔗</div>
+                <div class="entity-card-body">
+                    <div class="client-name" style="margin-bottom: 4px;">${escapeHtml(c.name || _('my_connections_title'))}</div>
+                    <div class="client-meta" style="display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap;">
+                        <span>🖥 ${escapeHtml(c.server_name || '—')}</span>
+                        <span style="color: var(--text-muted);">${escapeHtml(getProtocolLabel(c.protocol, c.protocol_name))}</span>
+                    </div>
+                </div>
+                <div class="client-actions entity-card-actions">
+                <button class="btn btn-secondary btn-sm btn-icon"
+                    onclick="showMyConfig('${escapeJs(c.id)}', '${escapeJs(c.name || 'Connection')}', '${escapeJs(c.protocol)}')"
+                    title="${_('show_config')}">
+                    📄
+                </button>
+                ${c.created_by === 'self_service'
+                    ? `<button class="btn btn-danger btn-sm btn-icon"
+                        onclick="deleteConnection('${escapeJs(c.id)}', '${escapeJs(c.name || 'Connection')}')"
+                        title="${_('delete_connection')}">${ICON_TRASH}</button>`
+                    : ''}
+                </div>
+            </div>
+        `).join('');
+    }
+
+    async function loadSelfServiceOptions() {
+        try {
+            const data = await apiCall('/api/my/connections/options');
+            ssOptions = data;
+            const controls = document.getElementById('selfServiceControls');
+            const disabledMsg = document.getElementById('selfServiceDisabledMsg');
+
+            if (data.enabled && data.servers && data.servers.length > 0) {
+                controls.classList.remove('hidden');
+                controls.style.display = 'flex';
+                disabledMsg.classList.add('hidden');
+                document.getElementById('connectionsCounter').textContent =
+                    _('connections_counter').replace('{0}', data.remaining_connections).replace('{1}', data.max_connections_per_user);
+            } else {
+                controls.classList.add('hidden');
+                controls.style.display = 'none';
+                if (!data.enabled) {
+                    disabledMsg.classList.remove('hidden');
+                }
+            }
+        } catch (err) {
+            const controls = document.getElementById('selfServiceControls');
+            controls.classList.add('hidden');
+            controls.style.display = 'none';
+        }
+    }
+
+    function populateCreateConnServers() {
+        const serverSelect = document.getElementById('createConnServer');
+        serverSelect.innerHTML = '';
+        if (!ssOptions || !ssOptions.servers || ssOptions.servers.length === 0) {
+            serverSelect.innerHTML = `<option disabled>${_('no_servers_available')}</option>`;
+            return;
+        }
+        for (const server of ssOptions.servers) {
+            const opt = document.createElement('option');
+            opt.value = server.id;
+            opt.textContent = server.name;
+            opt.dataset.protocols = JSON.stringify(server.protocols);
+            serverSelect.appendChild(opt);
+        }
+        updateCreateConnProtocols();
+    }
+
+    function updateCreateConnProtocols() {
+        const serverSelect = document.getElementById('createConnServer');
+        const protoSelect = document.getElementById('createConnProtocol');
+        protoSelect.innerHTML = '';
+
+        const selectedOpt = serverSelect.options[serverSelect.selectedIndex];
+        if (!selectedOpt || !selectedOpt.dataset.protocols) {
+            protoSelect.innerHTML = `<option disabled>${_('loading')}</option>`;
+            return;
+        }
+
+        const protocols = JSON.parse(selectedOpt.dataset.protocols);
+        for (const proto of protocols) {
+            const opt = document.createElement('option');
+            opt.value = proto.protocol;
+            opt.textContent = proto.name;
+            protoSelect.appendChild(opt);
+        }
+    }
+
+    function openCreateConnectionModal() {
+        document.getElementById('createConnName').value = '';
+        document.getElementById('createConnectionError').textContent = '';
+        populateCreateConnServers();
+        openModal('createConnectionModal');
+        setTimeout(() => document.getElementById('createConnName').focus(), 50);
+    }
+
+    async function submitCreateConnection(e) {
+        e.preventDefault();
+        const errEl = document.getElementById('createConnectionError');
+        errEl.textContent = '';
+
+        const serverId = parseInt(document.getElementById('createConnServer').value);
+        const protocol = document.getElementById('createConnProtocol').value;
+        const name = document.getElementById('createConnName').value.trim();
+
+        if (!name) {
+            errEl.textContent = _('name_required') || 'Name is required';
+            return false;
+        }
+
+        const btn = document.getElementById('createConnBtn');
+        const btnText = document.getElementById('createConnBtnText');
+        const spinner = document.getElementById('createConnSpinner');
+
+        btn.disabled = true;
+        btnText.textContent = _('creating');
+        spinner.classList.remove('hidden');
+
+        try {
+            const result = await apiCall('/api/my/connections/add', 'POST', {
+                server_id: serverId,
+                protocol: protocol,
+                name: name,
+            });
+
+            closeModal('createConnectionModal');
+
+            if (result.config) {
+                currentConfig = result.config;
+                currentVpnLink = result.vpn_link || '';
+                currentConfigName = name.replace(/\s+/g, '_');
+                document.getElementById('configModalTitle').textContent = `${_('connection_created')}`;
+                document.getElementById('configText').textContent = result.config;
+                document.getElementById('vpnLinkText').textContent = currentVpnLink;
+
+                switchConfigTab('conf');
+                openModal('configModal');
+                generateQR(result.config);
+            }
+
+            showToast(_('connection_created').replace('{}', name), 'success');
+
+            await Promise.all([loadSelfServiceOptions(), loadConnections()]);
+        } catch (err) {
+            errEl.textContent = err.message;
+        } finally {
+            btn.disabled = false;
+            btnText.textContent = _('create');
+            spinner.classList.add('hidden');
+        }
+        return false;
+    }
+
+    async function deleteConnection(connectionId, name) {
+        if (!confirm(_('delete_connection_confirm'))) return;
+
+        try {
+            await apiCall(`/api/my/connections/${connectionId}/delete`, 'POST');
+            showToast(_('connection_deleted'), 'success');
+            await Promise.all([loadSelfServiceOptions(), loadConnections()]);
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+        }
+    }
 
     async function showMyConfig(connectionId, name, proto) {
         try {
@@ -117,7 +395,6 @@
                 document.getElementById('configText').textContent = result.config;
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
 
-                // Telemt (MTProxy) doesn't have a "VPN Link" (vpn://) format in Amnezia
                 const vpnTab = document.querySelectorAll('.config-tab')[1];
                 const vpnPanel = document.getElementById('panel-vpn');
                 if (proto === 'telemt') {
@@ -128,7 +405,7 @@
 
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr_chunks);
             }
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');
@@ -143,14 +420,48 @@
         const tabIdx = { conf: 0, vpn: 1, qr: 2 };
         tabs[tabIdx[tab]].classList.add('active');
         document.getElementById(panels[tab]).classList.add('active');
+        // the frame series only animates while its panel is on screen
+        if (tab === 'qr') { renderQR(); } else { stopQrAnimation(); }
     }
 
-    function generateQR(text) {
+    // The QR shows one of two payloads: Amnezia's own config format, split into
+    // the frame series ImportController::parseQrCodeChunk reassembles, or the
+    // raw config, which is all AmneziaWG and wg-quick understand. The series
+    // exists because a whole config in one code lands at QR version 21-26,
+    // while the Android scanner reads 640x480 camera frames and cannot decode
+    // anything that dense. Every frame below stays under 55x55 modules.
+    const QR_FRAME_MS = 800;
+
+    let currentQrConfig = '';
+    let currentQrChunks = [];
+    let currentQrFormat = 'amnezia';
+    let qrFrame = 0;
+    let qrTimer = null;
+
+    function setQrFormat(format) {
+        currentQrFormat = format;
+        qrFrame = 0;
+        renderQR();
+    }
+
+    function generateQR(text, chunks) {
+        currentQrConfig = text || '';
+        currentQrChunks = chunks || [];
+        qrFrame = 0;
+        renderQR();
+    }
+
+    function stopQrAnimation() {
+        if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+    }
+
+    function drawQr(text, size) {
         const container = document.getElementById('qrCode');
+        if (!container) return;
         container.innerHTML = '';
         try {
             new QRCode(container, {
-                text: text, width: 280, height: 280,
+                text: text, width: size, height: size,
                 colorDark: '#000000', colorLight: '#ffffff',
                 correctLevel: QRCode.CorrectLevel.L
             });
@@ -158,5 +469,46 @@
             container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
         }
     }
+
+    function renderQR() {
+        stopQrAnimation();
+        const named = currentQrFormat === 'amnezia' && currentQrChunks.length > 0;
+        const switcher = document.getElementById('qrFormat');
+        if (switcher) {
+            switcher.classList.toggle('hidden', currentQrChunks.length === 0);
+            switcher.querySelectorAll('.qr-format-btn').forEach(b =>
+                b.classList.toggle('active', b.dataset.fmt === (named ? 'amnezia' : 'wireguard')));
+        }
+        const hint = document.getElementById('qrFormatHint');
+        if (!named) {
+            if (hint) hint.textContent = _('qr_format_wireguard_hint');
+            drawQr(currentQrConfig, qrSize(document.getElementById('qrCode') || document.body, 280));
+            return;
+        }
+        const paint = () => {
+            drawQr(currentQrChunks[qrFrame], qrSize(document.getElementById('qrCode') || document.body, 300));
+            if (hint) {
+                hint.textContent = currentQrChunks.length > 1
+                    ? `${_('qr_format_amnezia_hint')} ${qrFrame + 1}/${currentQrChunks.length}`
+                    : _('qr_format_amnezia_hint');
+            }
+        };
+        paint();
+        if (currentQrChunks.length > 1) {
+            qrTimer = setInterval(() => {
+                // the modal was closed or another tab opened -- offsetParent is
+                // null once the panel is off screen, so stop burning a timer
+                const container = document.getElementById('qrCode');
+                if (!container || !container.offsetParent) { stopQrAnimation(); return; }
+                qrFrame = (qrFrame + 1) % currentQrChunks.length;
+                paint();
+            }, QR_FRAME_MS);
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        loadSelfServiceOptions();
+        loadConnections();
+    });
 </script>
 {% endblock %}

@@ -52,12 +52,22 @@ class NginxManager:
         return 'active' in out2 or 'running' in out2.lower()
 
     def check_protocol_installed(self, protocol_type='nginx'):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.CONTAINER_NAME)
+            if _st is not None:
+                return _st[0]
         out, _, _ = self.ssh.run_sudo_command(
             f"docker ps -a --filter name=^{self.CONTAINER_NAME}$ --format '{{{{.Names}}}}'"
         )
         return self.CONTAINER_NAME in out.strip().split('\n')
 
     def check_container_running(self, protocol_type='nginx'):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.CONTAINER_NAME)
+            if _st is not None:
+                return _st[1]
         out, _, _ = self.ssh.run_sudo_command(
             f"docker ps --filter name=^{self.CONTAINER_NAME}$ --format '{{{{.Status}}}}'"
         )

@@ -141,6 +141,11 @@ class XrayManager:
         return 'Up' in out
 
     def check_protocol_installed(self):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.container_name)
+            if _st is not None:
+                return _st[0]
         out, _, _ = self.ssh.run_sudo_command(
             f"docker ps -a --filter name=^{self.container_name}$ --format '{{{{.Names}}}}'"
         )
@@ -202,7 +207,7 @@ RUN echo "fs.file-max = 51200" >> /etc/sysctl.conf && \\
     echo "net.ipv4.tcp_rmem = 4096 87380 67108864" >> /etc/sysctl.conf && \\
     echo "net.ipv4.tcp_wmem = 4096 65536 67108864" >> /etc/sysctl.conf && \\
     echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.conf && \\
-    echo "net.ipv4.tcp_congestion_control = hybla" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
 
 RUN mkdir -p /etc/security && \\
     echo "* soft nofile 51200" >> /etc/security/limits.conf && \\
@@ -400,9 +405,12 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
         tag = self._get_vless_inbound_tag(config)
         if not tag:
             return False
+        _ib = self._get_vless_inbound(config) or {}
         payload = {
             "inbounds": [{
                 "tag": tag,
+                "port": _ib.get('port', 443),
+                "listen": "0.0.0.0",
                 "protocol": "vless",
                 "settings": {
                     "clients": [client],
@@ -411,7 +419,7 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
             }]
         }
         ok, message = self._run_xray_api_json('adu', payload)
-        if not ok:
+        if not ok or 'Added 0 user' in (message or ''):
             logger.warning(f"Xray API add user failed: {message}")
             return False
         return True
@@ -675,7 +683,7 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 
         return clients_table
 
-    def get_client_config(self, protocol, client_id, server_host, port):
+    def get_client_config(self, protocol, client_id, server_host, port, public_port=None):
         clients = self._get_clients_table()
         client = next((c for c in clients if c['clientId'] == client_id), None)
         if not client: return None
@@ -698,14 +706,16 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
         encoded_name = urllib.parse.quote(name)
         
         url = (
-            f"vless://{client_id}@{server_host}:{meta.get('port', port)}"
+            # meta.json is synced from the live server.json, so it beats the
+            # port the panel remembers; an explicit public port beats both.
+            f"vless://{client_id}@{server_host}:{public_port or meta.get('port', port)}"
             f"?type=tcp&security=reality&pbk={meta['public_key']}"
             f"&sni={sni}&fp=chrome&sid={meta['short_id']}"
             f"&spx=%2F&flow=xtls-rprx-vision#{encoded_name}"
         )
         return url
 
-    def add_client(self, protocol, client_name, server_host, port):
+    def add_client(self, protocol, client_name, server_host, port, public_port=None):
         client_id = str(uuid.uuid4())
         
         config = self._get_server_json()
@@ -747,7 +757,7 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 
         return {
             'client_id': client_id,
-            'config': self.get_client_config(protocol, client_id, server_host, port)
+            'config': self.get_client_config(protocol, client_id, server_host, port, public_port)
         }
 
     def toggle_client(self, protocol, client_id, enable):
@@ -798,3 +808,16 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
         clients_table = [c for c in clients_table if c['clientId'] != client_id]
         self._save_clients_table(clients_table)
         return True
+
+    def rename_client(self, protocol, client_id, new_name):
+        """Rename a client. The display name lives in clientsTable
+        (userData.clientName) and is embedded into the VLESS URL fragment on
+        the fly, so updating the table is enough — UUID, keys and server.json
+        stay untouched and existing links keep working."""
+        clients_table = self._get_clients_table()
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            raise RuntimeError('Client not found')
+        client.setdefault('userData', {})['clientName'] = new_name
+        self._save_clients_table(clients_table)
+        return {'status': 'success', 'name': new_name}

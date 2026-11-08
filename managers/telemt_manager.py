@@ -4,6 +4,7 @@ import uuid
 import re
 import os
 import secrets
+import shlex
 from datetime import datetime
 from .ssh_manager import SSHManager
 
@@ -51,10 +52,12 @@ class TelemtManager:
 
     def _api_request(self, method, path, data=None):
         """Execute a curl request inside the docker container."""
-        cmd = f"docker exec {self.container_name} curl -s -X {method} {self.API_URL}{path}"
-        if data:
-            js_data = json.dumps(data).replace('"', '\\"')
-            cmd += f" -H 'Content-Type: application/json' -d \"{js_data}\""
+        args = ['docker', 'exec', self.container_name, 'curl', '-s', '--globoff',
+                '-X', method]
+        if data is not None:
+            args.extend(['-H', 'Content-Type: application/json', '-d', json.dumps(data)])
+        args.extend(['--', self.API_URL + path])
+        cmd = ' '.join(shlex.quote(arg) for arg in args)
         
         out, err, code = self.ssh.run_sudo_command(cmd)
         if code != 0:
@@ -70,6 +73,11 @@ class TelemtManager:
         return bool(out.strip())
 
     def check_protocol_installed(self):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.container_name)
+            if _st is not None:
+                return _st[0]
         out, _, _ = self.ssh.run_command(f"docker ps -a --filter name=^{self.container_name}$ --format '{{{{.Names}}}}'")
         return out.strip() == self.container_name
 
@@ -160,7 +168,8 @@ docker compose version
         if code != 0:
             raise RuntimeError(f"Failed to install docker compose plugin: {err or out}")
 
-    def install_protocol(self, protocol_type='telemt', port='443', tls_emulation=True, tls_domain="", max_connections=0):
+    def install_protocol(self, protocol_type='telemt', port='443', tls_emulation=True, tls_domain="",
+                         max_connections=0, public_host=None, public_port=None):
         results = []
         if not self.check_docker_installed():
             results.append("Installing Docker...")
@@ -192,12 +201,8 @@ docker compose version
             config_content = re.sub(r'max_connections\s*=\s*\d+', f'max_connections = {max_connections}', config_content)
 
         # Patch public_host and public_port for links
-        if "public_host =" in config_content or "# public_host =" in config_content:
-            config_content = re.sub(r'#?\s*public_host\s*=\s*".*?"', f'public_host = "{self.ssh.host}"', config_content)
-        else:
-            config_content = config_content.replace('[general.links]', f'[general.links]\npublic_host = "{self.ssh.host}"')
-            
-        config_content = re.sub(r'public_port\s*=\s*\d+', f'public_port = {port}', config_content)
+        config_content = self._patch_public_links(
+            config_content, public_host or self.ssh.host, public_port or port)
         
         # Remove default hello user
         config_content = re.sub(r'^hello\s*=\s*".*?"', '', config_content, flags=re.MULTILINE)
@@ -233,6 +238,42 @@ docker compose version
             "port": port,
             "log": results
         }
+
+    def _patch_public_links(self, config_content, host, port):
+        """Point [general.links] at the address clients must dial.
+
+        Telemt composes its own tg:// links from these two keys, so an address
+        the panel knows about (a second IP on the box, a domain) reaches
+        clients only once it lands here. The keys are matched line by line: a
+        pattern allowed to span lines swallows the preceding newline and welds
+        two config lines together.
+        """
+        host_re = re.compile(r'^[ \t]*#?[ \t]*public_host[ \t]*=[ \t]*".*?"', re.MULTILINE)
+        port_re = re.compile(r'^[ \t]*#?[ \t]*public_port[ \t]*=[ \t]*\d+', re.MULTILINE)
+        if host_re.search(config_content):
+            config_content = host_re.sub(f'public_host = "{host}"', config_content, count=1)
+        else:
+            config_content = config_content.replace(
+                '[general.links]', f'[general.links]\npublic_host = "{host}"', 1)
+        if port_re.search(config_content):
+            config_content = port_re.sub(f'public_port = {port}', config_content, count=1)
+        else:
+            config_content = config_content.replace(
+                '[general.links]', f'[general.links]\npublic_port = {port}', 1)
+        return config_content
+
+    def set_public_endpoint(self, host, port):
+        """Re-point the links of a running instance, without reinstalling it.
+
+        Returns False when there is no config on the server to patch.
+        """
+        config_text = self._get_server_config()
+        if not config_text.strip():
+            return False
+        patched = self._patch_public_links(config_text, host, port)
+        if patched != config_text:
+            self.save_server_config(self.protocol, patched)
+        return True
 
     def _get_server_config(self):
         out, _, code = self.ssh.run_sudo_command(f"cat {self._config_path()}")
@@ -393,7 +434,7 @@ docker compose version
 
         # Save config to host
         self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), f"{self._config_path()}")
-        
+
         # 2. Call API for immediate effect
         self._api_request("POST", "/v1/users", data=api_payload)
         
@@ -402,7 +443,7 @@ docker compose version
         
         # Extreme fallback if API is slow or 404
         if link == "Not found":
-            link = f"tg://proxy?server={host}&port={port}&secret={secret}"
+            link = self._build_client_link(secret, host, port, config_text)
         
         return {
             "client_id": username,
@@ -450,7 +491,7 @@ docker compose version
 
         # Save config to host
         self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), f"{self._config_path()}")
-        
+
         # API call
         self._api_request("PATCH", f"/v1/users/{client_id}", data=api_payload)
         return {"status": "success"}
@@ -554,7 +595,64 @@ docker compose version
         if restart:
             self.ssh.run_sudo_command(f"docker kill -s HUP {self.container_name} || docker restart {self.container_name}")
 
-    def get_client_config(self, protocol_type, client_id, host='', port=''):
+    def rename_client(self, protocol_type, client_id, new_name):
+        """Rename a Telemt user. The username *is* the client identity here,
+        so every `username = ...` line in all access.* sections is rewritten
+        (preserving the `#` disabled marker) and the runtime API user is
+        re-created under the new name with the same secret. Proxy links are
+        secret-based, so existing links keep working."""
+        new_username = re.sub(r'[^a-zA-Z0-9_.-]', '', (new_name or '').replace(' ', '_'))
+        if not new_username:
+            raise RuntimeError('Invalid name')
+        if new_username == client_id:
+            return {'status': 'success', 'name': new_username}
+
+        config_text = self._get_server_config()
+        users = self._parse_users_from_config(config_text)
+        entry_name = next((u for u in users if u.lstrip('#').strip() == client_id), None)
+        if entry_name is None:
+            raise RuntimeError('Client not found')
+        if any(u.lstrip('#').strip() == new_username for u in users):
+            raise RuntimeError('A client with this name already exists')
+
+        secret = users[entry_name]
+        enabled = not entry_name.startswith('#')
+
+        lines = config_text.split('\n')
+        in_access_section = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('[access.'):
+                in_access_section = True
+            elif stripped.startswith('['):
+                in_access_section = False
+            if not in_access_section:
+                continue
+            commented = stripped.startswith('#')
+            content = stripped.lstrip('#').strip()
+            if content.startswith(f'{client_id} =') or content.startswith(f'{client_id}='):
+                new_line = content.replace(client_id, new_username, 1)
+                lines[i] = f'# {new_line}' if commented else new_line
+        self.ssh.upload_file_sudo('\n'.join(lines).replace('\r\n', '\n'), f"{self._config_path()}")
+
+        # Sync the runtime: the API keys users by username, so swap the identity.
+        self._api_request("DELETE", f"/v1/users/{client_id}")
+        if enabled:
+            self._api_request("POST", "/v1/users", data={"username": new_username, "secret": secret})
+        self.ssh.run_sudo_command(f"docker kill -s HUP {self.container_name} || docker restart {self.container_name}")
+        return {'status': 'success', 'name': new_username, 'client_id': new_username}
+
+    def _build_client_link(self, secret, host, port, config_text):
+        """Build a fallback link using this instance's FakeTLS settings."""
+        params = self._parse_telemt_params(config_text)
+        if params.get('tls_emulation'):
+            domain = params.get('tls_domain', '').strip()
+            if not domain:
+                raise RuntimeError('Telemt FakeTLS is enabled but tls_domain is missing')
+            secret = 'ee' + secret + domain.encode('utf-8').hex()
+        return f"tg://proxy?server={host}&port={port}&secret={secret}"
+
+    def get_client_config(self, protocol_type, client_id, host='', port='', public_port=None):
         resp = self._api_request("GET", f"/v1/users/{client_id}")
         if resp and resp.get('ok'):
             user = resp.get('data', {})
@@ -567,5 +665,7 @@ docker compose version
         c = next((c for c in clients if c['clientId'] == client_id), None)
         if c:
             secret = c.get('userData', {}).get('token', '')
-            if secret: return f"tg://proxy?server={host}&port={port}&secret={secret}"
+            if secret:
+                return self._build_client_link(
+                    secret, host, public_port or port, self._get_server_config())
         return "Not found"

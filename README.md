@@ -1,6 +1,6 @@
 # Amnezia Web Panel
 
-A modern, high-performance web interface for managing **AmneziaWG**, **Classic WireGuard**, **Xray (XTLS-Reality)**, **Telemt (Telegram MTProxy)**, **Cloudflare WARP**, **AmneziaDNS**, **AdGuard Home**, **SOCKS5**, and **NGINX + Let's Encrypt** services on remote Ubuntu servers — from a single dashboard. Designed to provide a premium user experience with robust administrative capabilities.
+A modern, high-performance web interface for managing **AmneziaWG**, **Classic WireGuard**, **Xray (XTLS-Reality)**, **Telemt (Telegram MTProxy)**, **Cloudflare WARP**, **AmneziaDNS**, **AdGuard Home**, **SOCKS5**, **NGINX + Let's Encrypt** and **exit nodes** (entry ≠ egress) services on remote Ubuntu servers — from a single dashboard. Designed to provide a premium user experience with robust administrative capabilities.
 
 > ### 🔄 Compatibility with Official Amnezia Client
 > 
@@ -58,12 +58,14 @@ Configuration panel for system parameters and preferences:
 
 ## 🚀 Key Features
 
-*   **⚡ VPN Protocols**:
-    *   **AmneziaWG (AWG / AWG 2.0 / AWG Legacy)**: Advanced WireGuard-based protocol with S3/S4 obfuscation to bypass deep packet inspection (DPI). Three coexisting variants — modern AWG 2.0 with full junk-packet masking, and a legacy variant for older clients.
+*   **⚡ Protocols**:
+    *   **AmneziaWG (AWG 3.1 / AWG 2.0 / AWG Legacy)**: Advanced WireGuard-based protocol with S3/S4 obfuscation to bypass deep packet inspection (DPI). Three coexisting variants — modern AWG 2.0 with full junk-packet masking, and a legacy variant for older clients.
+    *   **Dual-stack (IPv6)**: enabled automatically only when IPv6 works end-to-end — a global address on the host *and* an IPv6 default route inside the protocol container. Docker networks are IPv4-only unless the daemon is configured for IPv6, so a host-only check would hand clients an IPv6 address with no route out. Override with the `AWG_IPV6` environment variable: `auto` (default), `off` to keep every tunnel IPv4-only, `on` to force dual-stack.
     *   **Classic WireGuard**: Standard, high-performance WireGuard protocol for unmatched speed and broad device compatibility with traffic monitoring support.
     *   **Xray (XTLS-Reality)**: Stealthy protocol that masks VPN traffic as standard HTTPS browsing. Pinned to **Xray-core v26.x**; transparently reads both the **panel layout** (`meta.json` + `clientsTable.json`) and the **native Amnezia client layout** (`xray_*.key` files + `clientsTable`), so a node first installed via the official mobile/desktop app can be attached to the panel without re-installation.
     *   **Telemt (Telegram MTProxy)**: High-performance Telegram MTProxy with TLS emulation and comprehensive management (quotas, IP limits, real-time session tracking). Robust install path that auto-configures Docker's official apt/yum repository when needed.
     *   **Cloudflare WARP**: Add and manage WARP-powered connectivity from the panel for routing and network flexibility.
+    *   **Exit nodes (entry ≠ egress)**: install the **Exit Node** service on the server that should be the egress (`amnezia-exit`, an AmneziaWG listener on `55520/udp` with a private transit subnet, optional obfuscation for hops crossing DPI), then link any AmneziaWG instance on another server to it from its card. The entry keeps its clients and their configs, SNATs them into its transit address and routes them through a second interface (`exit0`) inside the same container; a kill-switch is installed before the client tunnel comes up, so a dead exit blocks traffic instead of leaking the entry's IP. Links survive container restarts, server reorder and reinstalls of either side; the exit's Peers page shows handshake and transfer per entry. Open the transit UDP port for the entry nodes in the exit server's firewall. Settings can name a **default exit node**, which every AmneziaWG instance installed afterwards is linked to automatically. Restoring a protocol backup re-establishes the links the archive touched (and drops a link the panel does not track). Client DNS stays on the entry node by default; a switch on the link routes it through the exit instead, so a resolver never sees the entry's country (requires AmneziaDNS on the exit node). **Automatic failover** (off by default) lets an entry keep an ordered list of backup exits: the panel checks the active link on a timer (handshake age plus an optional curl probe through `exit0`) and, after N consecutive failures, switches to the next healthy backup without touching client peers; it can fail back to the primary after a configurable healthy period. A failed switch restores the previous `exit0.conf` instead of tearing the link down. State and a short event log are stored on the instance. MTU chain: client 1376 → `exit0` 1420 → +60 bytes (IPv4 endpoint) ≤ 1500. IPv4 only for now: while linked, client IPv6 is refused rather than leaking.
 *   **🛠 Services**:
     *   **AmneziaDNS**: Internal DNS resolver on a private docker network (`amnezia-dns-net`, IP `172.29.172.254`) to prevent DNS leaks and blockings.
     *   **AdGuard Home**: DNS-based ad blocker with a web admin UI. Two install modes: **Replace AmneziaDNS** (takes its IP, all VPN clients use AdGuard immediately) or **Side-by-side** (parallel deployment on `172.29.172.253`, web UI accessible only over the VPN by default). Optional opt-in checkboxes to expose the web UI / DoT / DoH on the host.
@@ -71,7 +73,9 @@ Configuration panel for system parameters and preferences:
     *   **NGINX + Let's Encrypt**: Reverse-proxy and HTTPS automation with certificate management for secure public endpoints.
 *   **⚙️ Core Server Management**:
     *   **Add / Edit / Delete / Reorder** server entries — drag-and-drop reorder updates `server_id` references in saved connections automatically.
+    *   Every server carries a stable `uid` (assigned on add and backfilled for existing records at startup) for cross-server references that must survive reorder and delete.
     *   **Live ping indicator** next to each server name — non-blocking TCP-connect probe to the SSH port, runs on the asyncio loop in parallel for all servers.
+    *   **Public address per protocol instance**: by default a client dials the same address the panel opens SSH to. When an instance answers somewhere else — a second IP on the box, a port forward, a domain name — set its own **public address** (🌐 on the instance card) and every config, `vless://` and `tg://` link the panel issues points there instead. Telemt prints its own links, so the address is written into its `config.toml` and applied without a restart. The setting belongs to the instance, not to the install: reinstalling the protocol keeps it, and re-issuing a config for an existing client yields the new address with the same keys.
     *   **Clear server** wipes every Amnezia-related container, image and `/opt/amnezia` directory in a single sudo script — works for any current or future `amnezia-*` protocol.
     *   **Reboot** the server directly from the UI.
     *   Strictly concurrent protocol status polling — all supported protocols/services checked in parallel for immediate feedback.
@@ -101,8 +105,22 @@ Configuration panel for system parameters and preferences:
     *   **Remnawave Sync**: Automatically import and sync users from Remnawave.
     *   **Simple Backup**: Effortless JSON-based export and restore of all panel data.
     *   **Backup / Migrate protocols (Alpha)**: Move protocol configurations between nodes for maintenance, recovery, and migration workflows.
+*   **📧 Email Delivery of Configurations**:
+    *   Send one user their configuration files and proxy links straight from their card, or mail every user that has an address in a single run.
+    *   AmneziaWG / WireGuard peers travel as `.conf` attachments plus the `vpn://` key; Xray and Telemt travel as links, since their config *is* the link. Files and links are independent switches — send either or both.
+    *   SMTP is configured in `/settings` (host, port, none/STARTTLS/SSL, credentials, sender name and address, Reply-To, timeout) with a one-click test message. The stored password is never echoed back to the page: leaving the field empty on save keeps it.
+    *   A mass send runs in the background over a single SMTP session and reports progress per user — sent, skipped (no address, disabled, no connections yet) or failed, with the reason next to each name. One unreachable node costs that one connection, not the message and not the run.
+    *   Messages are text plus an HTML alternative dressed in the panel's own appearance (title, logo, colours) — no third-party branding anywhere.
+*   **🧭 Networks Outside the VPN (client-side split tunneling)**:
+    *   A list of IPv4 networks in `/settings` that clients reach through their own ISP instead of the tunnel. Every WireGuard / AmneziaWG config the panel hands out — download, `vpn://` key, share link, self-service page, Telegram bot, email — gets `AllowedIPs = 0.0.0.0/0` minus the list minus local ranges; `::/0` stays as it was. Servers are not touched, so configs issued earlier keep working next to regenerated ones.
+    *   Type the list, load it from a file (plain CIDRs, `a-b` ranges, AmneziaVPN site lists, ipset dumps, JSON), or press **Load Russian networks** to fetch the current list from RIPEstat (fallbacks: ipdeny.com, country-ip-blocks); the fetched list is saved and switched on at once.
+    *   **Shorten the list** is on by default. The full Russian list is ~8.7k networks, ~22k AllowedIPs entries; on Windows every entry becomes a route (plus a broadcast route Windows adds), connecting takes minutes and the Network List Service keeps a CPU core busy. The shortened list keeps /16-and-larger networks plus the networks of popular Russian services (~1.1k entries) and does not load the CPU; anything left out simply stays in the tunnel.
+    *   A hand-edited config keeps following the list as long as its AllowedIPs still contains `0.0.0.0/0`; a deliberately narrowed line is left alone. AmneziaVPN's own site-based split tunneling is disabled for such configs (it needs `0.0.0.0/0, ::/0`).
+
 *   **🔗 Public Sharing**:
     *   Generate password-protected links for users to download their configurations without panel access.
+*   **🔐 Self-Service Security**:
+    *   Self-service users receive VPN peer access to the configured VPN subnet. Keep the panel/admin UI off user-reachable VPN routes unless intended, or constrain access with firewall rules and client `AllowedIPs`.
 *   **🌍 One-click Public Tunnels**:
     *   Open the local panel to the internet from `/settings` using **Cloudflare Quick Tunnel** or **ngrok**.
     *   Shows the local server URL, installation state, running state, and issued public HTTPS URLs directly in the UI.
@@ -176,12 +194,80 @@ Mac
 
 https://hub.docker.com/r/prvtpro/amnezia-panel
 
+Images are also published to GitHub Container Registry on every push to `main` and on every `v*` tag:
+
+```bash
+# Panel
+docker pull ghcr.io/prvtpro/amnezia-panel:latest
+
+# Panel with Cloudflare WARP inside the container
+docker pull ghcr.io/prvtpro/amnezia-panel:latest-warp
+```
+
+The bundled `docker-compose.yml` sets `DATA_FILE=/app/data/data.json` so panel state lands on the
+`amnezia_data` volume and survives container rebuilds — see [Environment Variables](#-environment-variables)
+for the full list of knobs.
+
+
+
+AWG connections created through the admin user-connection endpoint also use
+`<DATA_FILE>.peer-creates.json`. Keep this mode-0600 operation journal on the
+same persistent volume and include it in filesystem backups alongside `data.json`.
+It contains private key material; do not publish it. The JSON settings export is
+not a substitute for this backup. Run one panel process, as required by the
+in-process mutation/data locks. Retry the same `operation_id` after an uncertain
+response; the standard user-connection dialog retains it until success.
+
 
 ### Initial Login
 *   **Username**: `admin`
 *   **Password**: `admin`
 > [!IMPORTANT]  
 > Secure your panel by changing the default password in the **Users** section immediately after first login.
+
+## 🧰 Environment Variables
+
+Every variable is optional — the panel starts with working defaults. Paths marked `<app dir>` resolve
+next to `app.py`, or next to the executable in the standalone builds from *Installation Method 2*.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SECRET_KEY` | random on each start | Key used to sign session cookies. Without it a fresh key is generated at every start, which logs all admins out on restart — set a long random value in production. |
+| `DATA_FILE` | `<app dir>/data.json` | Path to the JSON state file (servers, users, API tokens, settings). `~` is expanded and missing parent directories are created on first save. |
+| `TUNNEL_STATE_FILE` | `<app dir>/tunnels_state.json` | Path where Cloudflare/ngrok tunnel runtime state (PID, public URL) is persisted between restarts. |
+| `TUNNEL_BIN_DIR` | `<app dir>/bin` | Directory holding the panel-managed `cloudflared` / `ngrok` binaries downloaded from the **Settings** page. |
+| `AWG_IPV6` | `auto` | Dual-stack policy for AWG tunnels: `auto` probes the host and the protocol container, `off` keeps every tunnel IPv4-only, `on` forces dual-stack. |
+
+Two things that are deliberately *not* environment variables: the port the panel listens on and its SSL
+certificates, both configured in **Settings → SSL** and stored in the state file. For ngrok, the authtoken
+comes from **Settings** as well and overrides an inherited `NGROK_AUTHTOKEN`.
+
+Running from source or from a binary:
+
+```bash
+export SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+export DATA_FILE=/var/lib/amnezia-panel/data.json
+python app.py
+```
+
+With Docker, pass the same variables through `-e`:
+
+```bash
+docker run -d \
+  -p 5000:5000 \
+  -e SECRET_KEY=change-me \
+  -e DATA_FILE=/state/data.json \
+  -v panel_state:/state \
+  ghcr.io/prvtpro/amnezia-panel:latest
+```
+
+Docker Compose additionally reads these from your shell or from an `.env` file next to
+`docker-compose.yml`. They configure Compose itself rather than the panel process:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `APP_PORT` | `5000` | Host port published for the panel container. |
+| `DATA_FILE` | `/app/data/data.json` | Forwarded into the container; keep it under `/app/data` so state stays on the `amnezia_data` volume. |
 
 ## 🔧 Project Details
 
@@ -222,12 +308,17 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 # Cheap reachability probe for monitoring
 curl -H "Authorization: Bearer $TOKEN" http://your-panel:5000/api/servers/0/ping
+
+# Publish an instance on another address (empty fields reset it to the server's own)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"protocol":"telemt","public_host":"203.0.113.9","public_port":"443"}' \
+  http://your-panel:5000/api/servers/0/protocol/public-endpoint
 ```
 
 ### Technology Stack
 *   **Backend**: FastAPI (Python), `asyncio` for concurrent SSH/probe work
 *   **Frontend**: Vanilla JS, Jinja2, Custom CSS (Glassmorphism, full set of CSS animations for promo blocks)
-*   **Database**: Local JSON storage (`data.json`) with an `asyncio.Lock` for thread-safe writes
+*   **Database**: Local JSON storage (`data.json`, path overridable via the `DATA_FILE` environment variable) with an `asyncio.Lock` for thread-safe writes
 *   **SSH Engine**: Paramiko
 
 ### Project Structure
@@ -235,7 +326,10 @@ curl -H "Authorization: Bearer $TOKEN" http://your-panel:5000/api/servers/0/ping
 ```
 web-panel/
 ├── app.py                    # FastAPI entry point + all routes
+├── exit_link_service.py      # Link / unlink / failover between entry and exit nodes
+├── exit_failover.py          # Health, thresholds and failback policy (no SSH)
 ├── telegram_bot.py           # Optional Telegram bot integration
+├── mail_service.py           # SMTP delivery of configs/links (single and bulk)
 ├── managers/                 # Protocol & service managers (one file per protocol)
 │   ├── ssh_manager.py        # SSH abstraction (Paramiko wrapper)
 │   ├── awg_manager.py        # AmneziaWG / AWG 2.0 / AWG Legacy
@@ -244,10 +338,12 @@ web-panel/
 │   ├── telemt_manager.py     # Telegram MTProxy
 │   ├── dns_manager.py        # AmneziaDNS (Unbound)
 │   ├── adguard_manager.py    # AdGuard Home
-│   └── socks5_manager.py     # 3proxy-based SOCKS5
-├── static/                   # CSS / favicon / vendored JS
+│   ├── socks5_manager.py     # 3proxy-based SOCKS5
+│   └── exit_manager.py       # Exit-node transit endpoint (amnezia-exit)
+├── static/                   # CSS / favicon / PWA icons / SW / vendored JS
 ├── templates/                # Jinja2 templates
 ├── translations/             # en / ru / fr / zh / fa
+├── pwa.py                    # Web app manifest builder
 └── data.json                 # Panel state (servers, users, tokens, settings)
 ```
 
@@ -255,8 +351,32 @@ web-panel/
 
 *   **Reverse Proxy**: It is highly recommended to run the panel behind Nginx/Apache with an SSL certificate.
 *   **SSH Keys**: Use SSH keys rather than passwords for connecting to your VPN servers.
-*   **Secret Key**: Set a custom `SECRET_KEY` environment variable for secure session management.
+*   **Secret Key**: Set a custom `SECRET_KEY` environment variable for secure session management (see [Environment Variables](#-environment-variables)).
+*   **IPv6**: if your servers have global IPv6 but Docker is IPv4-only, leave `AWG_IPV6` at `auto` — the panel probes the container and keeps tunnels IPv4-only rather than blackholing client IPv6. Set `AWG_IPV6=off` to disable dual-stack everywhere.
+*   **SMTP Password**: stored in `data.json` next to the other credentials. Use a mailbox dedicated to the panel (or an app password), not your personal account, and keep `data.json` readable only by the user the panel runs as.
 *   **API Tokens**: Treat each token like a password — store it in your integration's secret manager. Revoke it from `/settings` if it leaks or the integration is decommissioned. Rotate periodically; tokens inherit admin rights.
+
+## 📱 Progressive Web App (PWA)
+
+The panel is installable as a Progressive Web App on phones and desktops. On mobile (≤768px) you get a compact sticky header, a role-gated bottom tab bar, and touch-friendly controls; QR codes and forms adapt to narrow viewports.
+
+### Install
+
+*   **Android (Chrome / Edge)**: open the panel over HTTPS, then use the browser menu → **Install app** / **Add to Home screen**.
+*   **iOS (Safari)**: Share → **Add to Home Screen**. Standalone mode uses a translucent status bar; safe-area insets keep controls clear of the notch.
+*   After install, the app opens in standalone chrome with shortcuts to **Connections** (`/my`) and **Users** (`/users`).
+
+### HTTPS requirement
+
+Service workers (and therefore installability) require a **secure context**: HTTPS or `localhost`. The default `docker-compose.yml` exposes plain HTTP on port **5000**, which is fine for local development but **not** installable on a remote phone.
+
+To make the PWA installable in production, terminate TLS in one of these ways:
+
+*   Enable **HTTPS** in **Settings → SSL** (`settings.ssl`) with a certificate and key (or paste PEM text).
+*   Put the panel behind a reverse proxy with a real certificate.
+*   Use the built-in **Cloudflare Quick Tunnel** or **ngrok** tunnels from Settings — they provide public HTTPS URLs suitable for install and for sharing the panel.
+
+The service worker caches **only** `/static/*` assets. HTML pages and `/api/*` always hit the network so session-authenticated content is never shared across users on the same device.
 
 ## 🤝 Contributing
 
@@ -269,4 +389,3 @@ This project is licensed under the **GNU General Public License v3.0** - see the
 
 ---
 *Built with ❤️ for the Amnezia community.*
-

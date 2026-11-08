@@ -1,0 +1,50 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Install Chromium for UI regression tests
+      run: python -m playwright install --with-deps chromium
+
+    - name: Run unit tests
+      run: python -m unittest discover -s tests -v
+
+    - name: Verify backup and peer regressions as root with isolated state
+      run: |
+        sudo "$(command -v python)" - <<'PY'
+        import os, tempfile, unittest
+        with tempfile.TemporaryDirectory(prefix='backup-root-tests-') as state:
+            os.environ.update(DATA_FILE=state + '/data.json',
+                              SSH_KNOWN_HOSTS_FILE=state + '/known_hosts',
+                              TUNNEL_STATE_FILE=state + '/tunnels.json',
+                              SECRET_KEY='isolated-ci-fixture')
+            suite = unittest.defaultTestLoader.discover('tests', pattern='test_panel_backup.py')
+            for pattern in ('test_rknblock_app.py', 'test_server_page_render.py', 'test_destructive_accounting_guards.py'):
+                suite.addTests(unittest.defaultTestLoader.discover('tests', pattern=pattern))
+            result = unittest.TextTestRunner(verbosity=2).run(suite)
+            if not result.wasSuccessful():
+                raise SystemExit(1)
+        PY

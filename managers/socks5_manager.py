@@ -64,12 +64,22 @@ class Socks5Manager:
         return 'active' in out2 or 'running' in out2.lower()
 
     def check_protocol_installed(self, protocol_type='socks5'):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self._container_name(protocol_type))
+            if _st is not None:
+                return _st[0]
         out, _, _ = self.ssh.run_sudo_command(
             f"docker ps -a --filter name=^{self._container_name(protocol_type)}$ --format '{{{{.Names}}}}'"
         )
         return self._container_name(protocol_type) in out.strip().split('\n')
 
     def check_container_running(self, protocol_type='socks5'):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self._container_name(protocol_type))
+            if _st is not None:
+                return _st[1]
         out, _, _ = self.ssh.run_sudo_command(
             f"docker ps --filter name=^{self._container_name(protocol_type)}$ --format '{{{{.Status}}}}'"
         )

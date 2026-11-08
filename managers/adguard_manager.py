@@ -51,12 +51,22 @@ class AdguardManager:
         return 'active' in out2 or 'running' in out2.lower()
 
     def check_protocol_installed(self, protocol_type='adguard'):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.CONTAINER_NAME)
+            if _st is not None:
+                return _st[0]
         out, _, _ = self.ssh.run_sudo_command(
             f"docker ps -a --filter name=^{self.CONTAINER_NAME}$ --format '{{{{.Names}}}}'"
         )
         return self.CONTAINER_NAME in out.strip().split('\n')
 
     def check_container_running(self):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.CONTAINER_NAME)
+            if _st is not None:
+                return _st[1]
         out, _, _ = self.ssh.run_sudo_command(
             f"docker ps --filter name=^{self.CONTAINER_NAME}$ --format '{{{{.Status}}}}'"
         )
@@ -152,9 +162,10 @@ class AdguardManager:
     # ===================== INSTALL / REMOVE =====================
 
     def _ensure_network(self):
+        # Both halves need root: `sudo <ls> || <create>` would create unprivileged
         self.ssh.run_sudo_command(
-            f"docker network ls | grep -q {self.NETWORK_NAME} || "
-            f"docker network create --subnet {self.NETWORK_SUBNET} {self.NETWORK_NAME}"
+            f"sh -c 'docker network ls | grep -q {self.NETWORK_NAME} || "
+            f"docker network create --subnet {self.NETWORK_SUBNET} {self.NETWORK_NAME}'"
         )
 
     def install_protocol(
