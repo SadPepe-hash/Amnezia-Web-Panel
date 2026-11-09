@@ -2952,7 +2952,7 @@
             return `<tr><td data-label="${escapeHtml(_('server_ipv6_table_instance'))}">${escapeHtml(inst.proto)}</td>`
                 + `<td class="font-mono" dir="ltr" data-label="${escapeHtml(_('server_ipv6_table_subnet'))}">${escapeHtml(inst.subnet_v4 || '')}</td>`
                 + `<td data-label="${escapeHtml(_('server_ipv6_table_peers'))}">${peers}</td>`
-                + `<td data-label="IPv6">${on ? `<span class="badge badge-success mono" dir="ltr">${escapeHtml(inst.subnet_v6 || '')}</span>` : '—'}</td>`
+                + `<td data-label="IPv6">${on ? `<span class="badge badge-success mono" dir="ltr" title="${escapeHtml(inst.container || '')}">${escapeHtml(inst.subnet_v6 || '')}${inst.container ? `<span class="muted" style="font-size:11px;font-weight:400;" dir="ltr"> ${escapeHtml(inst.container)}</span>` : ''}</span>` : '—'}</td>`
                 + `<td data-label="${escapeHtml(_('server_ipv6_table_action'))}">${action}</td></tr>`;
         });
         body.innerHTML = rows.length ? rows.join('')

@@ -96,6 +96,7 @@ def instance(**overrides):
         'peers_v6': 0, 'ipv6_enabled': False, 'subnet_v6': None,
         'blocked_reason': 'none', 'can_enable': True, 'can_disable': True,
         'exit_linked': False, 'container_running': True,
+        'container': 'amnezia-awg3',
     }
     data.update(overrides)
     return data
@@ -334,6 +335,10 @@ class Ipv6UiBrowserTests(unittest.TestCase):
                              EN['server_ipv6_action_disable'])
             self.assertFalse(third.locator('button').is_disabled())
             self.assertIn('fd42:8:3::1/64', third.inner_text())
+            # The badge carries the container name, not only the subnet.
+            self.assertIn('amnezia-awg3', third.inner_text())
+            self.assertEqual(third.locator('.badge-success').get_attribute('title'),
+                             'amnezia-awg3')
 
             fourth = body.locator('tr').nth(3)
             self.assertEqual(fourth.locator('td').nth(2).inner_text().strip(), '—')
