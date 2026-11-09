@@ -11,7 +11,10 @@ HOST_STATS_COMMANDS = {
         "<(grep 'cpu ' /proc/stat) <(sleep 0.5 && grep 'cpu ' /proc/stat) 2>/dev/null"
     ),
     'ram': "free -b | awk 'NR==2{printf \"%d %d\", $3, $2}'",
-    'disk': "df -B1 / | awk 'NR==2{printf \"%d %d\", $3, $2}'",
+    'disk': (
+        "df -B1 -x tmpfs -x devtmpfs -x overlay -x squashfs -x devfs -x procfs -x sysfs 2>/dev/null | "
+        "awk 'NR>1 && $2>0 {used+=$3; total+=$2} END {if(total>0) printf \"%d %d\", used, total; else print \"0 0\"}'"
+    ),
     'network': (
         "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
         "cat /proc/net/dev | awk -v dev=\"$DEV:\" '$1==dev{printf \"%d %d\", $2, $10}'"
