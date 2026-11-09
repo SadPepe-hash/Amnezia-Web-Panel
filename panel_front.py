@@ -226,9 +226,41 @@ async def _pump(reader, writer):
             pass
 
 
+async def _read_head(reader):
+    """First client message: one complete TLS handshake record or an HTTP head.
+
+    Reads must be exact. A modern browser ClientHello (post-quantum key share)
+    is larger than one TCP segment; reading a single chunk hides the SNI and
+    the domain check would reject a legitimate browser.
+    """
+    try:
+        first = await asyncio.wait_for(reader.readexactly(5), timeout=15)
+    except asyncio.IncompleteReadError as exc:
+        return exc.partial
+    if len(first) >= 2 and first[0] == 0x16 and first[1] == 0x03:
+        need = int.from_bytes(first[3:5], 'big')
+        if need <= 0 or need > 16384:
+            return first
+        try:
+            body = await asyncio.wait_for(reader.readexactly(need), timeout=15)
+        except asyncio.IncompleteReadError as exc:
+            return first + (exc.partial or b'')
+        return first + body
+    buf = first
+    while b'\r\n\r\n' not in buf and len(buf) < 8192:
+        try:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=5)
+        except Exception:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
 async def _handle(reader, writer, backend):
     try:
-        head = await asyncio.wait_for(reader.read(4096), timeout=15)
+        head = await _read_head(reader)
     except Exception:
         _reset(writer)
         return

@@ -254,5 +254,71 @@ class FrontResponseTests(unittest.TestCase):
         self.assertNotIn(b'panel', data.lower())
 
 
+    def test_split_client_hello_reaches_the_backend_whole(self):
+        import asyncio
+        import socket
+        import threading
+        import time
+        import panel_front
+        hello = _client_hello('panel.example.com')
+        holder = []
+        ready = threading.Event()
+
+        async def backend(reader, writer):
+            data = b''
+            try:
+                while len(data) < len(hello):
+                    chunk = await reader.read(8192)
+                    if not chunk:
+                        break
+                    data += chunk
+            except Exception:
+                pass
+            writer.write(b'LEN:' + str(len(data)).encode())
+            await writer.drain()
+            writer.close()
+
+        def run_backend():
+            async def main():
+                server = await asyncio.start_server(backend, '127.0.0.1', 0)
+                holder.append(server.sockets[0].getsockname()[1])
+                ready.set()
+                async with server:
+                    await asyncio.sleep(4)
+            asyncio.run(main())
+
+        threading.Thread(target=run_backend, daemon=True).start()
+        self.assertTrue(ready.wait(3), 'backend did not start')
+        probe = socket.socket()
+        probe.bind(('127.0.0.1', 0))
+        front_port = probe.getsockname()[1]
+        probe.close()
+        threading.Thread(
+            target=panel_front.serve,
+            kwargs={'host': '127.0.0.1', 'port': front_port,
+                    'backend': ('127.0.0.1', holder[0])},
+            daemon=True).start()
+        sock = None
+        for _ in range(100):
+            try:
+                sock = socket.create_connection(('127.0.0.1', front_port), timeout=1)
+                break
+            except OSError:
+                time.sleep(0.05)
+        self.assertIsNotNone(sock, 'front did not start')
+        # Split the ClientHello across two TCP writes, like a >1.4 KB hello.
+        sock.sendall(hello[:40])
+        time.sleep(0.15)
+        sock.sendall(hello[40:])
+        reply = b''
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+        sock.close()
+        self.assertEqual(reply, b'LEN:' + str(len(hello)).encode(), reply)
+
+
 if __name__ == '__main__':
     unittest.main()
