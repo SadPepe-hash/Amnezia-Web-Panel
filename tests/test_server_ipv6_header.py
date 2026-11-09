@@ -7,6 +7,7 @@ link-local stay excluded), and the page renders a second mono line under
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -24,6 +25,17 @@ def server_with():
 
 
 class ServerStatsIpv6Tests(unittest.TestCase):
+    def test_batch_transport_failure_keeps_endpoint_available_with_errors(self):
+        client = self.client()
+        ssh = mock.Mock()
+        ssh.run_command.return_value = ('', 'synthetic timeout', -1)
+        with mock.patch.object(panel, 'get_ssh', return_value=ssh):
+            response = client.post('/api/servers/0/stats')
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn('batch', response.json()['errors'])
+        self.assertIn('cpu', response.json()['errors'])
+        self.assertEqual(response.json()['ipv6'], [])
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._data_file = panel.DATA_FILE
@@ -59,7 +71,11 @@ class ServerStatsIpv6Tests(unittest.TestCase):
                     if addr.startswith('fd') or (plen and int(plen) > 64):
                         continue
                     kept.append(addr)
-                return '\n'.join(kept) + ('\n' if kept else ''), '', 0
+                marker = re.search(r'@@HOST_STATS_[0-9a-f]+@@', cmd)[0]
+                fields = {'cpu': '0', 'ram': '0 0', 'disk': '0 0', 'network': '0 0',
+                          'uptime': '', 'ipv6': '\n'.join(kept)}
+                output = '\n'.join(marker + ':' + name + '\n' + value + '\n' + marker + ':end:' + name + ':0' for name, value in fields.items())
+                return output + '\n' + marker + ':done\n', '', 0
             return '0', '', 0
 
         ssh.run_command.side_effect = run_command
@@ -81,13 +97,19 @@ class ServerStatsIpv6Tests(unittest.TestCase):
         self.assertEqual(res.status_code, 200, res.text)
         self.assertEqual(res.json()['ipv6'], [])
 
-    def test_page_has_the_header_line_and_renders_it_only_with_data(self):
+    def test_page_shows_chips_from_ip_status_not_from_stats(self):
         page = open(os.path.join(os.path.dirname(panel.__file__),
                                  'templates', 'server.html'), encoding='utf-8').read()
-        self.assertIn('id="serverIpv6"', page)
-        self.assertIn("Array.isArray(stats.ipv6)", page)
-        self.assertIn("ipv6.join(' • ')", page)
-        self.assertIn("ipv6El.style.display = 'none'", page)
+        # The old duplicate `#serverIpv6` line is gone: IPv6 status has one
+        # source, the /ip-status endpoint.
+        self.assertNotIn('id="serverIpv6"', page)
+        self.assertNotIn("ipv6.join(' • ')", page)
+        self.assertIn('id="serverIpChips"', page)
+        self.assertIn('/ip-status', page)
+        self.assertIn('function renderIpChips', page)
+        self.assertIn('id="ipSettingsModal"', page)
+        # An old IPv4-only container is a fixable state, not a refusal.
+        self.assertIn("IP_AUTO_FIXABLE = new Set(['needs_recreate'])", page)
 
 
 if __name__ == '__main__':

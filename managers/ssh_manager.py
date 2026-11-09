@@ -15,6 +15,15 @@ from managers import ssh_trust
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_JUMP = object()
+_JUMP_RESOLVER = None
+
+
+def configure_jump_resolver(resolver):
+    """Set the panel callback that resolves a jump manager for an endpoint."""
+    global _JUMP_RESOLVER
+    _JUMP_RESOLVER = resolver
+
 
 def _conn_lock_of(obj):
     """_conn_lock, tolerating objects built without __init__ (tests)."""
@@ -25,12 +34,15 @@ class SSHManager:
     """Manages SSH connections and command execution on remote servers."""
 
     def __init__(self, host, port, username, password=None, private_key=None,
-                 connect_cooldown_base=30.0):
+                 connect_cooldown_base=30.0, jump_manager=_DEFAULT_JUMP):
         self.host = host
         self.port = int(port)
         self.username = username
         self.password = password
         self.private_key = private_key
+        self.jump_manager = (_JUMP_RESOLVER(host, int(port), username)
+                             if jump_manager is _DEFAULT_JUMP and _JUMP_RESOLVER
+                             else (None if jump_manager is _DEFAULT_JUMP else jump_manager))
         self.client = None
         self._is_root = (username == 'root')
         # Serializes connect/disconnect so concurrent threads (UI request
@@ -167,6 +179,15 @@ class SSHManager:
         elif self.password:
             kwargs['password'] = self.password
 
+        if self.jump_manager is not None:
+            self.jump_manager.ensure_connected()
+            transport = (self.jump_manager.client.get_transport()
+                         if self.jump_manager.client else None)
+            if not transport or not transport.is_active():
+                raise ConnectionError('SSH jump host transport is unavailable')
+            kwargs['sock'] = transport.open_channel(
+                'direct-tcpip', (self.host, self.port), ('127.0.0.1', 0))
+
         self.client.connect(**kwargs)
         # Keep NAT/stateful firewalls from silently dropping the idle
         # long-lived transport between command bursts.
@@ -211,13 +232,17 @@ class SSHManager:
     DOCKER_PS_TTL = 10.0
 
     def docker_ps_snapshot(self):
-        """Dict {container_name: state} from one `docker ps -a` command."""
+        """Dict {container_name: state}, or None when the probe fails."""
         now = time.time()
         cached = getattr(self, '_docker_ps_cache', None)
         if cached and now - cached[0] < self.DOCKER_PS_TTL:
             return cached[1]
         out, err, code = self.run_sudo_command(
             "docker ps -a --format '{{.Names}}\t{{.State}}'", timeout=30)
+        if code != 0:
+            # A denied/timed-out probe is unknown, not a successful empty list.
+            # Do not poison the shared cache or suppress per-container fallback.
+            return None
         states = {}
         if code == 0:
             for line in (out or '').splitlines():
@@ -235,6 +260,8 @@ class SSHManager:
         try:
             states = self.docker_ps_snapshot()
         except Exception:
+            return None
+        if states is None:
             return None
         return (name in states, states.get(name) == 'running')
 

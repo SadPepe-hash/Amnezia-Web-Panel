@@ -161,7 +161,10 @@ class ApiTokenAdminRouteTests(unittest.TestCase):
                         client.post('/api/servers/0/connections/config', headers=headers,
                                     json={'protocol': 'awg2', 'client_id': 'alice-key'}),
                     ]
-                    self.assertEqual({r.status_code for r in responses}, {403},
+                    # Browser requests without a session now have an explicit
+                    # 401 contract; rejected Bearer tokens retain their 403.
+                    expected = 403 if headers else 401
+                    self.assertEqual({r.status_code for r in responses}, {expected},
                                      [r.text for r in responses])
         self.assertEqual(self.usernames(), {'admin', 'support', 'alice', 'bob'})
 
@@ -252,7 +255,10 @@ class ApiTokenAdminRouteTests(unittest.TestCase):
 class TokenAwareGateGuardTests(unittest.TestCase):
     """Every admin JSON route must authorize through a token-aware helper."""
 
-    TOKEN_AWARE = {'_check_admin', '_backup_admin', '_ssh_trust_admin', '_request_user'}
+    # _require_admin_strict narrows _check_admin to the admin role; it is
+    # token-aware in the same way, so a Bearer admin token still passes.
+    TOKEN_AWARE = {'_check_admin', '_backup_admin', '_ssh_trust_admin', '_request_user',
+                   '_require_admin_strict'}
     # Session-only by design: login/captcha, a user's own data, password-shared links.
     SESSION_ONLY_PREFIXES = ('/api/auth/', '/api/my/', '/api/share/')
     # These read the session only to tell Bearer callers apart; both handle None.

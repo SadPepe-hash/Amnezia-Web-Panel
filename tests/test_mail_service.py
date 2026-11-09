@@ -137,7 +137,7 @@ def make_service(data, smtp_client=None, dead_hosts=(), **kwargs):
         config_payloads=lambda config, server, protocol: {
             'config': config, 'vpn_link': 'vpn://KEY-' + protocol, 'vpn_qr_chunks': [],
             'vpn_name': protocol},
-        protocol_display_name=lambda protocol: protocol.upper(),
+        protocol_display_name=lambda protocol, *metadata: protocol.upper(),
         protocol_base=lambda protocol: protocol.rstrip('0123456789') or protocol,
         translate=lambda key, lang='en': key,
         smtp_factory=lambda settings: client,
@@ -606,7 +606,7 @@ class MailApiTests(unittest.TestCase):
                                 ('get', '/api/users/mail/bulk/status')):
                 response = (client.get(url) if method == 'get'
                             else client.post(url, json={}))
-                self.assertEqual(response.status_code, 403, f'{method} {url}: {response.text}')
+                self.assertEqual(response.status_code, 401, f'{method} {url}: {response.text}')
 
     def test_sending_reports_the_error_in_the_admin_language(self):
         with TestClient(panel.app) as client:

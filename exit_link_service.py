@@ -277,7 +277,33 @@ class ExitLinkService:
                 mtu = int(await asyncio.to_thread(awg._get_mtu, protocol) or 0)
             except (TypeError, ValueError):
                 mtu = 0
-            ipv6 = bool(await asyncio.to_thread(awg._get_subnet_ipv6_ip, protocol))
+            try:
+                entry_config = await asyncio.to_thread(
+                    awg._get_server_config, protocol)
+            except Exception:
+                raise ExitLinkError(
+                    'state_unreadable',
+                    'Cannot read the instance config; retry')
+            if not (entry_config or '').strip():
+                raise ExitLinkError(
+                    'state_unreadable',
+                    'Cannot read the instance config; retry')
+            ipv6 = False
+            for line in entry_config.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith('Address'):
+                    continue
+                if '=' in stripped:
+                    tokens = stripped.split('=', 1)[1].split(',')
+                    ipv6 = any(':' in token for token in tokens)
+                break
+            if ipv6:
+                # The exit node publishes only IPv4: a dual-stack tunnel would
+                # send IPv6 into a black hole. Refuse at any peer count.
+                raise ExitLinkError(
+                    'exit_link_ipv6',
+                    'Instance has IPv6 enabled; disable IPv6 before linking '
+                    'to an exit node')
             if mtu > EXIT_MTU_LIMIT and not force:
                 raise ExitLinkError('exit_mtu_too_big',
                                     f'Client MTU {mtu} exceeds the link MTU {EXIT_MTU_LIMIT}; '
@@ -321,7 +347,9 @@ class ExitLinkService:
                                               lambda r: (r.get('exit_link') or {}).__setitem__('stale', reason))
                 return False
 
-            name = f"{entry.get('name') or entry.get('host', '')} / {self.protocol_display_name(protocol)}"
+            record = (entry.get('protocols') or {}).get(protocol, {})
+            label = self.protocol_display_name(protocol, record.get('header_protection'), record.get('protocol_version'))
+            name = f"{entry.get('name') or entry.get('host', '')} / {label}"
             peer = await asyncio.to_thread(exit_manager.add_peer, peer_id, name, entry_pub)
             link = {
                 'exit_uid': exit_uid,
@@ -374,6 +402,12 @@ class ExitLinkService:
                 'linked_at': datetime.now().isoformat(),
                 'stale': None,
             }
+            # Smart Route preferences live inside exit_link. A relink replaces
+            # that record; dropping them silently disables an already split
+            # instance while the host marker keeps applying throw routes.
+            for key in ('smart_route', 'smart_route_lost', 'smart_route_prev_dns'):
+                if key in previous:
+                    record[key] = previous[key]
             try:
                 await self._record_link(entry, exit_srv, protocol, record, source=source)
             except Exception:
