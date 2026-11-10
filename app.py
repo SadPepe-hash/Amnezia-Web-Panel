@@ -6336,9 +6336,19 @@ def op_finish(op, state, result=None, error=None):
 
 
 def _install_op_for_protocol(server_id, protocol):
-    """Newest operation of one protocol instance on one server."""
+    """Newest operation of one protocol instance on one server.
+
+    The poll carries the base name the user picked ('awg3'), while the
+    operation is stored under the resolved instance key of a new instance
+    ('awg3__2'). Matching by base family keeps the poll on the running
+    install instead of answering "Installation not found".
+    """
+    base = protocol_base(protocol)
     for op in reversed(list(_INSTALL_OPS.values())):
-        if op.get('server_id') == server_id and op.get('protocol') == protocol:
+        if op.get('server_id') != server_id:
+            continue
+        op_protocol = str(op.get('protocol') or '')
+        if op_protocol == protocol or protocol_base(op_protocol) == base:
             return op
     return None
 

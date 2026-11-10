@@ -369,6 +369,38 @@ class ProtocolProgressTests(EngineCase):
         self.assertEqual(len(tail['lines']), len(full['lines']) - 1)
         self.assertEqual(tail['next_offset'], full['next_offset'])
 
+    def test_progress_finds_a_new_instance_operation_by_base_name(self):
+        # "Add instance" stores the op under the resolved key (awg3__2) while
+        # the page keeps polling with the base it picked (awg3): the poll must
+        # track the running install instead of answering not-found.
+        self.write_data()
+        op = panel.op_create(0, 'protocol', panel.PROTOCOL_INSTALL_TOTAL)
+        op['protocol'] = 'awg3__2'
+        panel.op_log(op, 'build', 'docker build started')
+        client = self.admin()
+        res = client.get('/api/servers/0/install/progress',
+                         params={'protocol': 'awg3'})
+        self.assertEqual(res.status_code, 200, res.text)
+        payload = res.json()
+        self.assertEqual(payload['operation_id'], op['id'])
+        self.assertEqual(payload['state'], 'running')
+        # The payload echoes the queried base name; the op itself keeps the
+        # resolved instance key.
+        self.assertEqual(payload['protocol'], 'awg3')
+        self.assertEqual(payload['percent'], 40)
+
+    def test_progress_does_not_leak_across_protocol_families(self):
+        self.write_data()
+        op = panel.op_create(0, 'protocol', panel.PROTOCOL_INSTALL_TOTAL)
+        op['protocol'] = 'awg3__2'
+        panel.op_log(op, 'start', 'installing AmneziaWG 3.1 #2')
+        client = self.admin()
+        res = client.get('/api/servers/0/install/progress',
+                         params={'protocol': 'awg2'})
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(res.json()['code'], 'install_not_found')
+        self.assertNotEqual(op['protocol'], 'awg2')
+
     def test_progress_unknown_protocol_is_404(self):
         self.write_data()
         client = self.admin()
