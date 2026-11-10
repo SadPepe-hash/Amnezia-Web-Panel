@@ -35,8 +35,10 @@ class PanelBindHostTests(unittest.TestCase):
 
     def test_runtime_uses_the_saved_bind_setting(self):
         source = (ROOT / 'app.py').read_text(encoding='utf-8')
-        self.assertIn('"host": panel_bind_host(ssl_conf)', source)
-        self.assertNotIn('"host": "0.0.0.0"', source)
+        # Behind PANEL_FRONT the backend binds loopback explicitly; otherwise
+        # the saved opt-in decides (panel_bind_host).
+        self.assertIn("front_enabled else panel_bind_host(ssl_conf)", source)
+        self.assertNotIn('"host": \'0.0.0.0\'', source)
 
     def test_settings_save_preserves_the_explicit_bind_choice(self):
         request = panel.SaveSettingsRequest(
