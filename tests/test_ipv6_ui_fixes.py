@@ -184,12 +184,20 @@ class TestC5Styles(unittest.TestCase):
 
     def test_server_ip_chips_stack_without_resizing_header_actions(self):
         template = read_text(TEMPLATE_FILE)
-        self.assertIn('class="server-header__identity flex items-center gap-md"', template)
-        self.assertIn('class="server-header__details"', template)
+        # The compact adaptive header (upstream #309) replaced the old
+        # server-header__* block with the srv-header__* structure: identity
+        # and its details keep min-width: 0 so long IP chips wrap instead of
+        # stretching the header actions.
+        self.assertIn('class="srv-header__identity"', template)
+        self.assertIn('class="srv-header__ident"', template)
         chips = self.css[self.css.index('.ip-chips {'):]
         self.assertIn('flex-direction: column', chips[:240])
         self.assertIn('.page-header--card .page-header__actions {', self.css)
         self.assertIn('flex: 0 0 auto', self.css)
+        # The new header keeps its rules in an inline <style> block of the
+        # template: identity must not shrink below its content box.
+        self.assertIn('.srv-header__identity {', template)
+        self.assertIn('min-width: 0', template[template.index('.srv-header__identity {'):][:200])
 
 
 class TestC6Translations(unittest.TestCase):

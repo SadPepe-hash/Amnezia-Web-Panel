@@ -118,6 +118,9 @@ const MARKETPLACE_CATEGORIES=[{id:'security',titleKey:'security',icon:''}];
 document.body.dataset.serverUid='fixture-node';
 const _=key=>key, escapeHtml=value=>String(value), protoDomKey=value=>value, protoBase=value=>value.split('__')[0], protoInstance=()=>1;
 const isMultiInstanceBase=()=>false, isAppInstalled=()=>false, orderedProtocolEntries=()=>[], baseInstalled=()=>false;
+// Header badges (upstream #309): the harness extracts only the functions under
+// test, so the shared icon table they render with has to be stubbed here.
+const HEADER_BADGE_ICONS={ok:'',error:'',warn:'',info:''};
 const applyCustomTitles=()=>{},renderSmartRouteCard=()=>{},showToast=()=>{},openModal=()=>{},closeModal=()=>{},hideConnectionsSection=()=>{};
 // The store flow hands installs to the shared progress modal; in this harness
 // it simply refreshes the card from the (stubbed) API.
