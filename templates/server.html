@@ -2455,10 +2455,20 @@
         <div id="exitLinkState" style="margin-bottom:var(--space-md);"></div>
         <div id="exitLinkEgress"></div>
         <div id="exitLinkWarnings"></div>
-        <div class="form-group">
+        <div class="form-group" id="exitSingleGroup">
             <label class="form-label">{{ _('exit_link_select') }}</label>
             <select class="form-input" id="exitLinkSelect"></select>
             <div class="form-hint" id="exitLinkSelectHint"></div>
+        </div>
+        <div class="form-group hidden" id="exitChainGroup">
+            <label class="form-label">{{ _('exit_chain_title') }}</label>
+            <div class="form-hint" id="exitChainHint">{{ _('exit_chain_hint') }}</div>
+            <div id="exitChainRows"></div>
+            <div style="display:flex; gap:var(--space-sm); margin-top:var(--space-sm);">
+                <select class="form-input" id="exitChainAddSelect"></select>
+                <button type="button" class="btn btn-secondary" onclick="addExitChainHop()" id="exitChainAddBtn">{{ _('exit_chain_add') }}</button>
+            </div>
+            <div class="form-hint" id="exitChainMtuHint" style="margin-top:var(--space-sm);"></div>
         </div>
         <div class="form-group hidden" id="exitDnsGroup">
             <label class="form-label" style="display:flex; align-items:center; gap:var(--space-sm);">
@@ -2517,6 +2527,34 @@
             </div>
             <div class="form-label" style="margin-top:var(--space-md);">{{ _('exit_failover_events') }}</div>
             <div id="exitFailoverEvents" class="form-hint"></div>
+        </div>
+        <div class="form-group hidden" id="exitChainStatusGroup" style="border-top:1px solid var(--border, rgba(127,127,127,.25)); padding-top:var(--space-md);">
+            <label class="form-label">{{ _('exit_chain_status_title') }}</label>
+            <div id="exitChainStatus"></div>
+            <div style="display:flex; flex-wrap:wrap; gap:var(--space-sm); margin-top:var(--space-sm);">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="pollExitChain()">{{ _('exit_chain_probe') }}</button>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="repairExitChain()">{{ _('exit_chain_repair') }}</button>
+                <button type="button" class="btn btn-danger btn-sm" onclick="removeExitChain()">{{ _('exit_chain_delete') }}</button>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:var(--space-sm); margin-top:var(--space-md);">
+                <div>
+                    <label class="form-label">{{ _('exit_chain_poll_interval') }}</label>
+                    <input class="form-input" type="number" id="exitChainInterval" min="10" max="3600" value="30">
+                </div>
+                <div>
+                    <label class="form-label">{{ _('exit_chain_recover_attempts') }}</label>
+                    <input class="form-input" type="number" id="exitChainAttempts" min="1" max="20" value="3">
+                </div>
+                <div>
+                    <label class="form-label">{{ _('exit_chain_recover_interval') }}</label>
+                    <input class="form-input" type="number" id="exitChainRetryInterval" min="30" max="86400" value="300">
+                </div>
+            </div>
+            <div style="display:flex; gap:var(--space-sm); margin-top:var(--space-sm);">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="saveExitChainConfig()">{{ _('exit_chain_poll_save') }}</button>
+            </div>
+            <div class="form-label" style="margin-top:var(--space-md);">{{ _('exit_chain_events') }}</div>
+            <div id="exitChainEvents" class="form-hint"></div>
         </div>
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="closeModal('exitLinkModal')">{{ _('cancel') }}</button>
@@ -5508,7 +5546,9 @@
     let currentExitLinkState = null;
     const EXIT_LINK_ERROR_KEYS = ['exit_no_handshake', 'exit_mtu_too_big', 'exit_self', 'exit_legacy_obfuscation',
         'exit_not_found', 'exit_apply_failed', 'exit_in_use', 'exit_egress_failed', 'exit_dns_needs_dns',
-        'not_linked', 'failover_no_backups', 'exit_link_ipv6'];
+        'not_linked', 'failover_no_backups', 'exit_link_ipv6',
+        'chain_empty', 'chain_too_long', 'chain_duplicate_node', 'chain_mtu_override_required',
+        'failover_not_allowed_with_chain'];
     let currentExitFailoverBackups = [];
     let currentExitNodes = [];
 
@@ -5577,7 +5617,9 @@
         unlinkBtn.classList.toggle('hidden', !link);
         document.getElementById('exitEgressBtn').classList.toggle('hidden', !link);
         document.getElementById('exitDnsGroup').classList.toggle('hidden', !link);
-        document.getElementById('exitFailoverGroup').classList.toggle('hidden', !link);
+        const chainMode = !!(link && (link.chain || []).length > 1);
+        // A chain may never be silently repaired by failover.
+        document.getElementById('exitFailoverGroup').classList.toggle('hidden', chainMode || !link);
         document.getElementById('exitDnsViaExit').checked = !!(link && link.dns_via_exit);
         // Smart Route split toggle: only meaningful for a linked instance.
         const srGroup = document.getElementById('smartRouteGroup');
@@ -5653,6 +5695,18 @@
             });
             document.getElementById('exitLinkBtn').disabled = !candidates.length;
             renderExitLinkState(state);
+            // chain state (a legacy single link reads as a one-hop chain)
+            try {
+                const chain = await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain/status`, 'POST',
+                                            { protocol: proto });
+                currentExitChainView = chain.chain || null;
+                renderExitChainRowsFromView(chain.chain || { chain: [], poll: {} });
+            } catch (chainErr) {
+                currentExitChain = [];
+                renderExitChainRows();
+                document.getElementById('exitChainGroup').classList.remove('hidden');
+                document.getElementById('exitChainStatusGroup').classList.add('hidden');
+            }
         } catch (err) {
             document.getElementById('exitLinkState').innerHTML = `<div class="form-hint">${_('error')}: ${escapeHtml(err.message)}</div>`;
         }
@@ -5686,6 +5740,9 @@
     }
 
     async function saveExitLink(force = false) {
+        if (currentExitChain && currentExitChain.length > 1) {
+            return saveExitChain(false);
+        }
         const uid = document.getElementById('exitLinkSelect').value;
         if (!uid) return;
         if (currentExitLinkState && currentExitLinkState.ipv6 && !confirm(_('exit_link_ipv6_confirm'))) return;
@@ -5693,8 +5750,250 @@
     }
 
     async function removeExitLink() {
+        if (currentExitChain && currentExitChain.length > 1) {
+            return removeExitChain();
+        }
         if (!confirm(_('exit_unlink_confirm'))) return;
         await exitLinkRequest('/remove', { protocol: currentExitLinkProto }, 'exit_unlinked');
+    }
+
+    // ========== Exit node chain (multi-hop egress) ==========
+    let currentExitChain = [];
+    let currentExitChainProbes = {};
+    let currentExitChainView = null;
+
+    function exitChainCandidates() {
+        const own = document.body.dataset.serverUid || '';
+        return (currentExitNodes || []).filter(n => n.uid && n.uid !== own && !currentExitChain.includes(n.uid));
+    }
+
+    function exitChainHopLabel(uid) {
+        const node = (currentExitNodes || []).find(n => n.uid === uid) || {};
+        return `${node.name || uid}${node.host ? ' (' + node.host + (node.port ? ':' + node.port : '') + ')' : ''}${node.obfuscation ? ' [AWG]' : ''}`;
+    }
+
+    function renderExitChainRows() {
+        const box = document.getElementById('exitChainRows');
+        if (!currentExitChain.length) {
+            box.innerHTML = `<div class="form-hint">${_('exit_chain_none')}</div>`;
+        } else {
+            box.innerHTML = currentExitChain.map((uid, idx) => {
+                const probe = currentExitChainProbes[uid];
+                const probeText = probe
+                    ? (probe.ok
+                        ? (probe.rtt_ms !== null && probe.rtt_ms !== undefined
+                            ? _('exit_chain_probe_ok').replace('{ms}', Math.round(probe.rtt_ms))
+                            : _('exit_chain_probe_ok').replace('{ms}', '?'))
+                        : `<span style="color:var(--danger,#f87171)">${_('exit_chain_probe_failed')}</span>`)
+                    : '';
+                return `<div style="display:flex; align-items:center; gap:var(--space-sm); margin-top:4px;">
+                    <span style="flex:1">${idx + 1}. ${escapeHtml(exitChainHopLabel(uid))}${idx === currentExitChain.length - 1 ? ` <span class="badge badge-success">${_('exit_chain_final')}</span>` : ''}${idx === 0 ? '' : ''}</span>
+                    <span class="form-hint" id="exitChainProbe-${escapeHtml(uid)}">${probeText}</span>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="moveExitChainHop(${idx}, -1)" ${idx === 0 ? 'disabled' : ''}>↑</button>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="moveExitChainHop(${idx}, 1)" ${idx === currentExitChain.length - 1 ? 'disabled' : ''}>↓</button>
+                    <button type="button" class="btn btn-danger btn-sm" onclick="removeExitChainHop(${idx})">×</button>
+                </div>`;
+            }).join('');
+        }
+        const add = document.getElementById('exitChainAddSelect');
+        add.innerHTML = '';
+        const candidates = exitChainCandidates();
+        candidates.forEach(n => {
+            const opt = document.createElement('option');
+            opt.value = n.uid;
+            opt.textContent = exitChainHopLabel(n.uid);
+            add.appendChild(opt);
+        });
+        add.disabled = !candidates.length;
+        document.getElementById('exitChainAddBtn').disabled = !candidates.length;
+        renderExitChainMtuHint();
+    }
+
+    function renderExitChainMtuHint() {
+        const box = document.getElementById('exitChainMtuHint');
+        if (!box) return;
+        const hops = Math.max(1, currentExitChain.length);
+        if (hops <= 1) { box.textContent = ''; return; }
+        const mtu = currentExitLinkState && currentExitLinkState.mtu ? currentExitLinkState.mtu : null;
+        const budget = Math.max(1280, 1420 - 80 * (hops - 1));
+        box.innerHTML = `⚠ ${_('exit_chain_mtu_warning').replace('{mtu}', budget).replace('{n}', hops)}`
+            + (mtu && mtu > budget ? ` <b>${_('exit_chain_mtu_will_lower')}</b>` : '');
+    }
+
+    function renderExitChainRowsFromView(view) {
+        currentExitChain = (view.chain || []).map(h => h.uid).filter(Boolean);
+        currentExitChainProbes = {};
+        renderExitChainRows();
+        document.getElementById('exitChainInterval').value = view.poll.check_interval_seconds || 30;
+        document.getElementById('exitChainAttempts').value = view.poll.probe_attempts || 3;
+        document.getElementById('exitChainRetryInterval').value = view.poll.probe_interval_seconds || 300;
+        const chainMode = currentExitChain.length > 1;
+        document.getElementById('exitSingleGroup').classList.toggle('hidden', chainMode);
+        document.getElementById('exitChainGroup').classList.toggle('hidden', false);
+        document.getElementById('exitChainStatusGroup').classList.toggle('hidden', !currentExitChain.length);
+        document.getElementById('exitLinkBtnText').textContent = chainMode ? _('exit_chain_save') : _('exit_link_btn');
+        document.getElementById('exitFailoverGroup').classList.toggle('hidden', !chainMode ? !currentExitChain.length : true);
+        if (view.failover_blocked) {
+            document.getElementById('exitFailoverEnabled').checked = false;
+        }
+        renderExitChainStatus(view);
+    }
+
+    function exitChainStatusBadge(row) {
+        if (row.ok) return `<span class="badge badge-success"><span class="badge-dot"></span> ${_('exit_chain_status_ok')}</span>`;
+        if (row.reason === 'no_handshake' || row.reason === 'handshake_stale') {
+            return `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('exit_status_down')}</span>`;
+        }
+        return `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('exit_chain_status_pending')}</span>`;
+    }
+
+    function renderExitChainStatus(view) {
+        const box = document.getElementById('exitChainStatus');
+        const hops = (view.poll && view.poll.state && view.poll.hops) ? view.poll.hops : null;
+        const events = (view.poll && view.poll.events) || [];
+        if (!currentExitChain.length) { box.innerHTML = ''; return; }
+        if (!hops) {
+            box.innerHTML = `<div class="form-hint">${_('exit_chain_probe_hint')}</div>`;
+        } else {
+            box.innerHTML = `<div class="table-wrap"><table class="table"><thead><tr>
+                <th>${_('exit_chain_hop')}</th><th>${_('exit_chain_col_name')}</th><th>${_('exit_chain_col_status')}</th>
+                <th>${_('exit_chain_col_rtt')}</th><th>${_('exit_chain_col_handshake')}</th><th>${_('exit_chain_col_traffic')}</th>
+                </tr></thead><tbody>` + hops.map(h => `<tr>
+                <td>${h.index + 1}</td>
+                <td>${escapeHtml(currentExitChain.length > h.index ? exitChainHopLabel(currentExitChain[h.index]) : (h.uid || ''))}</td>
+                <td>${exitChainStatusBadge(h)}</td>
+                <td>${h.rtt_ms !== null && h.rtt_ms !== undefined ? Math.round(h.rtt_ms) + ' ms' : '—'}</td>
+                <td>${h.handshake_age !== null && h.handshake_age !== undefined ? _('exit_chain_handshake_ago').replace('{s}', h.handshake_age) : '—'}</td>
+                <td>${formatBytes(h.rx_bytes || 0)} ↓ ${formatBytes(h.tx_bytes || 0)} ↑</td>
+                </tr>`).join('') + `</tbody></table></div>`;
+        }
+        const staleLine = view.stale
+            ? `<div class="form-hint" style="color:var(--danger,#f87171)">⚠ ${_('exit_chain_broken').replace('{n}', String(view.stale).split('_').pop())}</div>` : '';
+        box.innerHTML = staleLine + box.innerHTML;
+        document.getElementById('exitChainEvents').innerHTML = events.length
+            ? events.slice(0, 8).map(e => `<div>${escapeHtml(e.ts || '')} · ${escapeHtml(e.action || '')} · ${escapeHtml(e.reason || '')}</div>`).join('')
+            : `<div class="form-hint">${_('exit_chain_no_events')}</div>`;
+    }
+
+    async function addExitChainHop() {
+        const select = document.getElementById('exitChainAddSelect');
+        const uid = select.value;
+        if (!uid) return;
+        const after = currentExitChain.length ? currentExitChain[currentExitChain.length - 1] : null;
+        const cell = document.getElementById('exitChainAddBtn');
+        cell.disabled = true;
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain/probe`, 'POST',
+                                     { protocol: currentExitLinkProto, uid, after_uid: after });
+            currentExitChainProbes[uid] = { ok: res.ok, rtt_ms: res.rtt_ms };
+        } catch (err) {
+            currentExitChainProbes[uid] = { ok: false, rtt_ms: null };
+            showToast(_('error') + ': ' + (err.message || ''), 'error');
+        } finally {
+            cell.disabled = false;
+        }
+        currentExitChain.push(uid);
+        renderExitChainRows();
+    }
+
+    function moveExitChainHop(index, delta) {
+        const target = index + delta;
+        if (target < 0 || target >= currentExitChain.length) return;
+        const [uid] = currentExitChain.splice(index, 1);
+        currentExitChain.splice(target, 0, uid);
+        currentExitChainProbes = {};
+        renderExitChainRows();
+    }
+
+    function removeExitChainHop(index) {
+        currentExitChain.splice(index, 1);
+        currentExitChainProbes = {};
+        renderExitChainRows();
+        const chainMode = currentExitChain.length > 1;
+        document.getElementById('exitSingleGroup').classList.toggle('hidden', chainMode);
+    }
+
+    async function saveExitChain(force = false) {
+        if (!currentExitChain.length) { showToast(_('exit_chain_empty'), 'error'); return; }
+        if (currentExitChain.length === 1) {
+            return saveExitLink(force);
+        }
+        const body = { protocol: currentExitLinkProto, chain: currentExitChain, force };
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain`, 'POST', body);
+            (res.warnings || []).forEach(w => showToast(_(w), 'info'));
+            showToast(_('exit_chain_saved'), 'success');
+            closeModal('exitLinkModal');
+            setTimeout(() => checkServer(), 600);
+        } catch (err) {
+            const text = EXIT_LINK_ERROR_KEYS.includes(err.message) ? _(err.message) : err.message;
+            if (err.message === 'chain_mtu_override_required') {
+                if (confirm(`${text}\n\n${_('exit_link_force')}?`)) {
+                    return saveExitChain(true);
+                }
+                return;
+            }
+            showToast(_('error') + ': ' + text, 'error');
+        }
+    }
+
+    async function removeExitChain() {
+        if (!confirm(_('exit_chain_delete_confirm'))) return;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain/remove`, 'POST',
+                          { protocol: currentExitLinkProto });
+            showToast(_('exit_chain_deleted'), 'success');
+            closeModal('exitLinkModal');
+            setTimeout(() => checkServer(), 600);
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function repairExitChain() {
+        if (!confirm(_('exit_chain_repair_confirm'))) return;
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain/repair`, 'POST',
+                                      { protocol: currentExitLinkProto });
+            showToast(_('exit_chain_repaired'), 'success');
+            if (res.exit_link) { currentExitChain = (res.exit_link.chain || []).map(h => h.uid); }
+            closeModal('exitLinkModal');
+            setTimeout(() => checkServer(), 600);
+        } catch (err) {
+            const text = EXIT_LINK_ERROR_KEYS.includes(err.message) ? _(err.message) : err.message;
+            showToast(_('error') + ': ' + text, 'error');
+        }
+    }
+
+    async function pollExitChain() {
+        const box = document.getElementById('exitChainStatus');
+        box.innerHTML = `<div class="form-hint">${_('exit_chain_probing')}</div>`;
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain/poll`, 'POST',
+                                      { protocol: currentExitLinkProto });
+            const view = res.chain || {};
+            view.poll = view.poll || {};
+            view.poll.hops = (res.result || {}).hops || view.poll.hops;
+            currentExitChainView = view;
+            renderExitChainStatus(view);
+            showToast(_('exit_chain_probed').replace('{action}', res.result.action || ''), 'info');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function saveExitChainConfig() {
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain/config`, 'POST', {
+                protocol: currentExitLinkProto,
+                check_interval_seconds: parseInt(document.getElementById('exitChainInterval').value, 10) || 30,
+                probe_attempts: parseInt(document.getElementById('exitChainAttempts').value, 10) || 3,
+                probe_interval_seconds: parseInt(document.getElementById('exitChainRetryInterval').value, 10) || 300,
+            });
+            showToast(_('exit_chain_poll_saved'), 'success');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
     }
 
     async function checkExitEgress() {

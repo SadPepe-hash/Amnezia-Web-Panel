@@ -65,6 +65,7 @@ from managers.backup_manager import BackupManager
 import telegram_bot as tg_bot
 
 from exit_link_service import ExitLinkError, ExitLinkService
+import exit_chain as chain_policy
 from smartroute_service import SmartRouteError, SmartRouteService, split_instances
 from warp_service import (
     INSTANCE_STATES,
@@ -2785,6 +2786,31 @@ class ExitFailoverRequest(BaseModel):
     probe_egress: Optional[bool] = None
 
 
+class ExitChainRequest(BaseModel):
+    """Build a chain: ordered exit-node uids, first hop faces the entry."""
+    protocol: str = 'awg'
+    chain: List[str] = []
+    force: Optional[bool] = False
+    mtu_override: Optional[bool] = False
+
+
+class ExitChainProbeRequest(BaseModel):
+    """Availability check of one hop, measured from the previous node."""
+    protocol: str = 'awg'
+    uid: str
+    after_uid: Optional[str] = None
+
+
+class ExitChainConfigRequest(BaseModel):
+    """Poll settings of an existing chain."""
+    protocol: str = 'awg'
+    enabled: Optional[bool] = None
+    check_interval_seconds: Optional[int] = None
+    probe_attempts: Optional[int] = None
+    probe_interval_seconds: Optional[int] = None
+    handshake_max_age_seconds: Optional[int] = None
+
+
 class SrvWarpRequest(BaseModel):
     """Body shared by every /warp POST (query-equivalent server_uid)."""
     server_uid: Optional[str] = None
@@ -3301,6 +3327,7 @@ async def startup():
     # Start periodic background tasks
     asyncio.create_task(periodic_background_tasks())
     asyncio.create_task(exit_failover_background_loop())
+    asyncio.create_task(exit_chain_poll_background_loop())
 
     # Re-apply public-port forwards on the fleet: hand-made iptables rules do
     # not survive reboots on their own, and only some hosts persist them.
@@ -3551,6 +3578,9 @@ async def periodic_background_tasks():
 FAILOVER_SCHEDULER_SECONDS = 15
 _exit_failover_loop_enabled = True
 
+CHAIN_POLL_SCHEDULER_SECONDS = 10
+_exit_chain_poll_loop_enabled = True
+
 
 async def exit_failover_background_loop():
     """Health-check opt-in exit-link failovers. Per-instance interval lives on
@@ -3566,6 +3596,22 @@ async def exit_failover_background_loop():
         except Exception as e:
             logger.error(f"Error in exit_failover_background_loop: {e}")
         await asyncio.sleep(FAILOVER_SCHEDULER_SECONDS)
+
+
+async def exit_chain_poll_background_loop():
+    """Health-check exit-node chains. One pass = one tick per chain instance;
+    the per-chain interval lives on the protocol record (default 30s)."""
+    if not _exit_chain_poll_loop_enabled:
+        return
+    await asyncio.sleep(25)
+    while True:
+        if not _exit_chain_poll_loop_enabled:
+            return
+        try:
+            await exit_link_svc.run_chain_poll_pass()
+        except Exception as e:
+            logger.error(f"Error in exit_chain_poll_background_loop: {e}")
+        await asyncio.sleep(CHAIN_POLL_SCHEDULER_SECONDS)
 
 
 # ======================== PAGE ROUTES ========================
@@ -7144,6 +7190,149 @@ async def api_exit_link_failover_check(request: Request, server_id: int, req: Pr
     except Exception as e:
         logger.exception("Error running exit failover check")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+# ===== Exit-node chain (multi-hop egress) =====
+
+@app.post('/api/servers/{server_id}/exit-link/chain', tags=["Protocols"])
+@serialize_peer_lifecycle
+async def api_exit_link_chain(request: Request, server_id: int, req: ExitChainRequest):
+    """Build (or rebuild) an ordered chain of exit nodes for one instance."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        result = await exit_link_svc.build_chain(
+            server_id, req.protocol, req.chain or [],
+            force=bool(req.force), mtu_override=bool(req.mtu_override))
+        _invalidate_ip_status_for_server(server_id)
+        return result
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except chain_policy.ChainError as e:
+        return JSONResponse({'error': e.message, 'code': e.code}, status_code=400)
+    except Exception as e:
+        logger.exception("Error building the exit chain")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/chain/remove', tags=["Protocols"])
+@serialize_peer_lifecycle
+async def api_exit_link_chain_remove(request: Request, server_id: int, req: ProtocolRequest):
+    """Remove a chain: peers and interfaces of every hop, then the record."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        result = await exit_link_svc.remove_chain(server_id, req.protocol)
+        _invalidate_ip_status_for_server(server_id)
+        return result
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error removing the exit chain")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/chain/repair', tags=["Protocols"])
+@serialize_peer_lifecycle
+async def api_exit_link_chain_repair(request: Request, server_id: int, req: ProtocolRequest):
+    """Full rebuild of the stored chain (operator action, never automatic)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        result = await exit_link_svc.repair_chain(server_id, req.protocol)
+        _invalidate_ip_status_for_server(server_id)
+        return result
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error repairing the exit chain")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/chain/probe', tags=["Protocols"])
+async def api_exit_link_chain_probe(request: Request, server_id: int, req: ExitChainProbeRequest):
+    """Availability + latency of one hop, measured from the previous node."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.chain_probe(server_id, req.protocol, req.uid,
+                                               after_uid=req.after_uid)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error probing a chain hop")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/chain/status', tags=["Protocols"])
+async def api_exit_link_chain_status(request: Request, server_id: int, req: ProtocolRequest):
+    """Saved chain + poll state; no SSH unless the caller asks for a live pass."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        entry, rec = exit_link_svc._entry(data, server_id, req.protocol)
+        chain = exit_link_svc.chain_view(data, rec, entry.get('uid'))
+        try:
+            payload = await exit_link_svc.status(server_id, req.protocol)
+        except ExitLinkError as e:
+            payload = {'exit_link': rec.get('exit_link'), 'error': e.code}
+        return {
+            'status': 'success',
+            'chain': chain,
+            'exit_link': payload.get('exit_link'),
+            'exit_link_status': payload.get('exit_link_status'),
+            'exit_failover': payload.get('exit_failover'),
+        }
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error reading the exit chain status")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/chain/poll', tags=["Protocols"])
+async def api_exit_link_chain_poll(request: Request, server_id: int, req: ProtocolRequest):
+    """Run one chain health pass now and apply the fail-closed decision."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        result = await exit_link_svc.poll_chain(server_id, req.protocol)
+        data = load_data()
+        entry, rec = exit_link_svc._entry(data, server_id, req.protocol)
+        return {'status': 'success',
+                'result': result,
+                'chain': exit_link_svc.chain_view(data, rec, entry.get('uid'))}
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error polling the exit chain")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/chain/config', tags=["Protocols"])
+async def api_exit_link_chain_config(request: Request, server_id: int, req: ExitChainConfigRequest):
+    """Poll settings of a chain: interval, recovery attempts and wait."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        payload = req.model_dump()
+        protocol = payload.pop('protocol')
+        fields = {key: value for key, value in payload.items() if value is not None}
+        return await exit_link_svc.configure_chain_poll(server_id, protocol, **fields)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error saving the exit chain poll settings")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.get('/api/servers/exit_chain_flags', tags=["Protocols"])
+async def api_exit_chain_flags(request: Request):
+    """Derived flags for the server list: one badge per broken chain."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    return {'flags': exit_link_svc.chain_flags(load_data())}
 
 
 @app.post('/api/servers/{server_id}/smartroute/install', tags=["Protocols"])

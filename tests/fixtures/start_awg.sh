@@ -95,6 +95,18 @@ x_exit_sync() {
   if [ -f "$EXIT_CONF" ]; then x_killswitch_on && x_link_up
   else x_link_down; x_killswitch_off; fi
 }
+x_chain_gate() {
+  # Fail-closed gate of the entry egress, driven by the health of the whole
+  # chain (not just this link): "off" drops clients into a blackhole instead
+  # of letting them leave via eth0, "on" restores the exit default route.
+  if [ "$1" = "off" ]; then
+    ip -4 route replace blackhole default metric 900 table $EXIT_TABLE
+  else
+    ip -4 route replace default dev $EXIT_IF table $EXIT_TABLE
+  fi
+  if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $X_SUBNET >/dev/null 2>&1; fi
+  echo "chain gate $1: $(ip -4 route show table $EXIT_TABLE | head -1)"
+}
 [ -f "$EXIT_CONF" ] && x_killswitch_on
 
 

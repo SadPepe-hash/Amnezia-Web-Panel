@@ -132,7 +132,12 @@ class ExitNodeUiWiringTests(unittest.TestCase):
         self.assertIn('id="exitFailoverEvents"', self.page)
         self.assertIn("exit-link/failover", self.page)
         self.assertIn("exit-link/failover/check", self.page)
-        self.assertIn("document.getElementById('exitFailoverGroup').classList.toggle('hidden', !link);", self.page)
+        # hidden when the instance has no link, and for a chain (a hop may
+        # never be silently substituted by failover)
+        self.assertIn(
+            "document.getElementById('exitFailoverGroup').classList.toggle('hidden', chainMode || !link);",
+            self.page)
+        self.assertIn('const chainMode = !!(link && (link.chain || []).length > 1);', self.page)
         for fn in ('saveExitFailover', 'runExitFailoverCheck', 'addExitFailoverBackup',
                    'renderExitFailover', 'renderExitFailoverEvents'):
             self.assertRegex(self.page, rf"function {fn}\(")

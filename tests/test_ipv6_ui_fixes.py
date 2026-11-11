@@ -30,6 +30,54 @@ NEW_KEYS = {
     "server_ipv6_discard_confirm",
     "server_ipv6_enable_docker_first",
     "server_ipv6_apply_or_revert_hint",
+    # exit-node chain (multi-hop egress)
+    "exit_chain_title",
+    "exit_chain_hint",
+    "exit_chain_final",
+    "exit_chain_none",
+    "exit_chain_add",
+    "exit_chain_probe_ok",
+    "exit_chain_probe_failed",
+    "exit_chain_status_title",
+    "exit_chain_status_ok",
+    "exit_chain_status_pending",
+    "exit_chain_hop",
+    "exit_chain_col_name",
+    "exit_chain_col_status",
+    "exit_chain_col_rtt",
+    "exit_chain_col_handshake",
+    "exit_chain_col_traffic",
+    "exit_chain_handshake_ago",
+    "exit_chain_broken",
+    "exit_chain_probe",
+    "exit_chain_probing",
+    "exit_chain_probed",
+    "exit_chain_probe_hint",
+    "exit_chain_repair",
+    "exit_chain_repaired",
+    "exit_chain_save",
+    "exit_chain_saved",
+    "exit_chain_delete",
+    "exit_chain_delete_confirm",
+    "exit_chain_deleted",
+    "exit_chain_poll_interval",
+    "exit_chain_recover_attempts",
+    "exit_chain_recover_interval",
+    "exit_chain_poll_save",
+    "exit_chain_poll_saved",
+    "exit_chain_events",
+    "exit_chain_no_events",
+    "exit_chain_mtu_warning",
+    "exit_chain_mtu_will_lower",
+    "exit_chain_empty",
+    "exit_chain_too_long",
+    "exit_chain_duplicate_node",
+    "exit_chain_self",
+    "exit_chain_mtu_override",
+    "chain_mtu_override_required",
+    "exit_failover_not_allowed_with_chain",
+    "exit_chain_badge_broken",
+    "exit_chain_badge_broken_hint",
 }
 
 # The catalogue had 1218 key names right before panel access (#305). Freeze
@@ -48,8 +96,29 @@ PANEL_ACCESS_KEYS = {
 }
 
 
-SECURITY_SETUP_KEYS = {
-    'setup_title', 'setup_password_confirm', 'setup_submit', 'setup_creating',
+# Exit-node chain (multi-hop egress): declared additions after the freeze.
+EXIT_CHAIN_KEYS = {
+    'exit_chain_title', 'exit_chain_hint', 'exit_chain_final', 'exit_chain_none',
+    'exit_chain_add', 'exit_chain_probe_ok', 'exit_chain_probe_failed',
+    'exit_chain_status_title', 'exit_chain_status_ok', 'exit_chain_status_pending',
+    'exit_chain_hop', 'exit_chain_col_name', 'exit_chain_col_status',
+    'exit_chain_col_rtt', 'exit_chain_col_handshake', 'exit_chain_col_traffic',
+    'exit_chain_handshake_ago', 'exit_chain_broken', 'exit_chain_probe',
+    'exit_chain_probing', 'exit_chain_probed', 'exit_chain_probe_hint',
+    'exit_chain_repair', 'exit_chain_repaired', 'exit_chain_save', 'exit_chain_saved',
+    'exit_chain_delete', 'exit_chain_delete_confirm', 'exit_chain_deleted',
+    'exit_chain_poll_interval', 'exit_chain_recover_attempts',
+    'exit_chain_recover_interval', 'exit_chain_poll_save', 'exit_chain_poll_saved',
+    'exit_chain_events', 'exit_chain_no_events', 'exit_chain_mtu_warning',
+    'exit_chain_mtu_will_lower', 'exit_chain_empty', 'exit_chain_too_long',
+    'exit_chain_duplicate_node', 'exit_chain_self', 'exit_chain_mtu_override',
+    'chain_mtu_override_required', 'exit_failover_not_allowed_with_chain',
+    'exit_chain_badge_broken', 'exit_chain_badge_broken_hint',
+    'exit_chain_repair_confirm',
+}
+
+
+SECURITY_SETUP_KEYS = {    'setup_title', 'setup_password_confirm', 'setup_submit', 'setup_creating',
     'setup_error', 'setup_username_invalid', 'setup_password_short',
     'setup_password_mismatch', 'setup_already_completed', 'legacy_backup_disabled',
 }
@@ -207,7 +276,7 @@ class TestC6Translations(unittest.TestCase):
         for locale in LOCALES[1:]:
             self.assertEqual(sets[locale], base, locale)
         self.assertTrue(PANEL_ACCESS_KEYS <= base, 'panel access translations missing')
-        previous = '\n'.join(sorted(base - PANEL_ACCESS_KEYS - SECURITY_SETUP_KEYS))
+        previous = '\n'.join(sorted(base - PANEL_ACCESS_KEYS - SECURITY_SETUP_KEYS - EXIT_CHAIN_KEYS))
         self.assertEqual(hashlib.sha256(previous.encode('utf-8')).hexdigest(),
                          PRE_PANEL_ACCESS_KEYS_SHA256,
                          'Existing catalogue changed outside the declared additions')

@@ -171,6 +171,7 @@
             </div>
 
             <div id="rkn-alert-{{ loop.index0 }}" class="rkn-scan-alert" style="display:none; margin-top:8px;"></div>
+            <div id="chain-alert-{{ loop.index0 }}" class="exit-chain-alert" style="display:none; margin-top:8px;"></div>
 
             <div class="server-actions">
                 <span class="reorder-btns">
@@ -933,7 +934,29 @@
         startAllPings();
         setupDragAndDrop();
         loadRknScanFlags();
+        loadExitChainFlags();
     });
+
+    // Red "exit chain broken" badge per server card: the chain is not passing
+    // traffic and the clients of that instance have no internet (fail-closed).
+    async function loadExitChainFlags() {
+        const escapeHtml = (value) => String(value == null ? '' : value)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        try {
+            const flags = await apiCall('/api/servers/exit_chain_flags', 'GET');
+            for (const [id, f] of Object.entries((flags && flags.flags) || {})) {
+                if (!f) continue;
+                const el = document.getElementById('chain-alert-' + id);
+                if (!el) continue;
+                el.innerHTML = `<button class="btn btn-danger btn-sm" style="width:100%; font-weight:700"
+                    onclick="location.href='/server/${id}#proto-awg'" title="${escapeHtml(_('exit_chain_badge_broken_hint'))}">⚠ {{ _('exit_chain_badge_broken') }} · ${_('exit_chain_hop')} ${escapeHtml(String(f.hop || ''))}</button>`;
+                el.style.display = '';
+            }
+        } catch (e) {
+            console.warn('exit chain flags failed:', e);
+        }
+    }
 
     // Red "scans detected" button per server card, fed from the cached flags endpoint.
     async function loadRknScanFlags() {

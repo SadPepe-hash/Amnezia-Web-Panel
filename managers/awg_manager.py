@@ -2976,6 +2976,18 @@ x_exit_sync() {
   if [ -f "$EXIT_CONF" ]; then x_killswitch_on && x_link_up
   else x_link_down; x_killswitch_off; fi
 }
+x_chain_gate() {
+  # Fail-closed gate of the entry egress, driven by the health of the whole
+  # chain (not just this link): "off" drops clients into a blackhole instead
+  # of letting them leave via eth0, "on" restores the exit default route.
+  if [ "$1" = "off" ]; then
+    ip -4 route replace blackhole default metric 900 table $EXIT_TABLE
+  else
+    ip -4 route replace default dev $EXIT_IF table $EXIT_TABLE
+  fi
+  if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $X_SUBNET >/dev/null 2>&1; fi
+  echo "chain gate $1: $(ip -4 route show table $EXIT_TABLE | head -1)"
+}
 """
 
     @staticmethod
@@ -3149,6 +3161,32 @@ x_warp_up() {
             'PersistentKeepalive = 25',
         ]
         return '\n'.join(lines) + '\n'
+
+    def exit_chain_gate(self, protocol_type, enabled):
+        """Close or restore the entry egress by chain health (fail-closed).
+
+        `enabled=False` replaces the exit default route in the policy table
+        with a blackhole: clients keep their tunnel but have no internet until
+        the whole chain is healthy again (or the operator repairs it).
+        """
+        container_name = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        functions = self._exit_shell_functions(
+            config_path, self._quick_binary(protocol_type),
+            f"{AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}")
+        action = 'x_chain_gate on\n' if enabled else 'x_chain_gate off\n'
+        self.ssh.upload_file(functions + action, "/tmp/_amnz_gate.sh")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_gate.sh {container_name}:/tmp/_amnz_gate.sh")
+        if code != 0:
+            self.ssh.run_command("rm -f /tmp/_amnz_gate.sh")
+            raise RuntimeError(f"exit chain gate failed: {err or out}")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec {container_name} bash /tmp/_amnz_gate.sh", timeout=60)
+        self.ssh.run_command("rm -f /tmp/_amnz_gate.sh")
+        if code != 0:
+            raise RuntimeError(f"exit chain gate failed: {out or err or f'SSH exit code {code}'}")
+        return out
 
     def exit_prepare_keys(self, protocol_type):
         """Create the entry-side key pair inside the container (kept if it
