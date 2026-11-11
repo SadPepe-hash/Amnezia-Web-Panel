@@ -1,8 +1,10 @@
 """The panel binds to loopback unless an admin explicitly exposes it."""
+import ast
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import app as panel
@@ -12,6 +14,33 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PanelBindHostTests(unittest.TestCase):
+    def test_environment_can_enable_all_interfaces_without_rewriting_saved_state(self):
+        saved = {'bind_all_interfaces': False}
+        with mock.patch.dict(panel.os.environ, {'PANEL_BIND_ALL_INTERFACES': '1'}):
+            self.assertEqual(panel.panel_bind_host(saved), '0.0.0.0')
+        self.assertFalse(saved['bind_all_interfaces'])
+
+    def test_environment_can_force_loopback_when_saved_setting_is_enabled(self):
+        saved = {'bind_all_interfaces': True}
+        for value in ('0', 'false', 'off', 'no'):
+            with self.subTest(value=value), mock.patch.dict(panel.os.environ,
+                                                            {'PANEL_BIND_ALL_INTERFACES': value}):
+                self.assertEqual(panel.panel_bind_host(saved), '127.0.0.1')
+
+    def test_unset_environment_keeps_saved_setting(self):
+        with mock.patch.dict(panel.os.environ, {}, clear=True):
+            self.assertEqual(panel.panel_bind_host({'bind_all_interfaces': True}), '0.0.0.0')
+            self.assertEqual(panel.panel_bind_host({'bind_all_interfaces': False}), '127.0.0.1')
+
+    def test_bundled_compose_files_enable_external_access_with_env_override(self):
+        import yaml
+        for name in ('docker-compose.yml', 'docker-compose.warp.yml'):
+            with self.subTest(compose=name):
+                document = yaml.safe_load((ROOT / name).read_text(encoding='utf-8'))
+                environment = document['services']['amnezia_panel']['environment']
+                self.assertEqual(environment['PANEL_BIND_ALL_INTERFACES'],
+                                 '${PANEL_BIND_ALL_INTERFACES:-1}')
+
     def test_ssl_model_defaults_to_loopback_only(self):
         settings = panel.SSLSettings()
         self.assertFalse(settings.bind_all_interfaces)
@@ -35,8 +64,42 @@ class PanelBindHostTests(unittest.TestCase):
 
     def test_runtime_uses_the_saved_bind_setting(self):
         source = (ROOT / 'app.py').read_text(encoding='utf-8')
-        self.assertIn('"host": panel_bind_host(ssl_conf)', source)
-        self.assertNotIn('"host": "0.0.0.0"', source)
+        startup = next(node for node in ast.parse(source).body
+                       if isinstance(node, ast.If)
+                       and ast.unparse(node.test) == "__name__ == '__main__'")
+        assignments = {node.targets[0].id: node for node in startup.body
+                       if isinstance(node, ast.Assign) and len(node.targets) == 1
+                       and isinstance(node.targets[0], ast.Name)}
+        # Execute only bind selection/dict construction, never application
+        # startup, threads, sockets, TLS files or a front/server process.
+        setup = ast.Module(body=[assignments['front_enabled'],
+                                 assignments['uvicorn_kwargs']],
+                           type_ignores=[])
+        code = compile(ast.fix_missing_locations(setup), str(ROOT / 'app.py'), 'exec')
+        for front in (None, '0', '1'):
+            for saved in (None, False, True):
+                with self.subTest(front=front, bind_all_interfaces=saved):
+                    ssl = {} if saved is None else {'bind_all_interfaces': saved}
+                    bind = mock.Mock(wraps=panel.panel_bind_host)
+                    namespace = {'__builtins__': {}, 'app': object(), 'ssl_conf': ssl,
+                                 'internal_port': 5001, 'panel_bind_host': bind,
+                                 'os': SimpleNamespace(
+                                     environ={} if front is None else {'PANEL_FRONT': front})}
+                    exec(code, namespace)
+                    self.assertEqual(namespace['front_enabled'], front == '1')
+                    expected = ('127.0.0.1' if front == '1'
+                                else panel.panel_bind_host(ssl))
+                    self.assertEqual(namespace['uvicorn_kwargs']['host'], expected)
+                    if front == '1':
+                        bind.assert_not_called()
+                    else:
+                        bind.assert_called_once_with(ssl)
+        calls = [node for node in ast.walk(startup) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == 'run'
+                 and isinstance(node.func.value, ast.Name) and node.func.value.id == 'uvicorn']
+        self.assertEqual(len(calls), 2, 'check backend launch in both modes')
+        for call in calls:
+            self.assertEqual(ast.unparse(call), 'uvicorn.run(**uvicorn_kwargs)')
 
     def test_settings_save_preserves_the_explicit_bind_choice(self):
         request = panel.SaveSettingsRequest(
