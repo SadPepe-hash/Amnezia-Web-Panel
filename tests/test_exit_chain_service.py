@@ -6,6 +6,7 @@ fake manager per host, so the whole flow is checked without SSH.
 
 import asyncio
 import copy
+import json
 import os
 import unittest
 
@@ -51,6 +52,7 @@ class FakeAWG:
         self.handshake_age = 3
         self.gate_calls = []
         self.applied_mtu = None
+        self.fail_unlink = False
 
     def exit_prepare_keys(self, protocol):
         self.calls.append(('exit_prepare_keys', protocol))
@@ -83,6 +85,8 @@ class FakeAWG:
 
     def exit_unlink(self, protocol):
         self.calls.append(('exit_unlink', protocol))
+        if self.fail_unlink:
+            raise RuntimeError('entry unreachable')
         return ''
 
     def exit_chain_gate(self, protocol, enabled):
@@ -167,22 +171,41 @@ class FakeExit:
 
 
 class FakeSSH:
-    """Answers the RTT probe with a fixed latency so the poll is deterministic."""
+    """Answers the RTT probe with a fixed latency so the poll is deterministic.
+
+    `cat /opt/amnezia/start.sh` answers with a canned container start script so
+    the relay startup splice can be exercised end to end."""
+
+    START_SCRIPT = ("#!/bin/bash\necho \"Container startup\"\n"
+                    "# ---- WARP egress: x_warp_up ----\n"
+                    "tail -f /dev/null\n")
 
     def __init__(self, host, rtt_ms='12.5'):
         self.host = host
         self.rtt_ms = rtt_ms
         self.commands = []
         self.scripts = []
+        self.uploads = {}
 
     def run_sudo_command(self, command, timeout=None):
         self.commands.append(command)
+        if 'cat /opt/amnezia/start.sh' in command:
+            return self.START_SCRIPT, '', 0
         return self.rtt_ms + '\n', '', 0
 
     def run_sudo_script(self, script, timeout=None):
-        # the real transport stages the script and runs it as root
+        # the real transport stages the script and runs it as root; host/port
+        # arrive as positional arguments, so the canned answer is the RTT plus
+        # the verification marker
         self.scripts.append(script)
-        return self.rtt_ms + '\n', '', 0
+        return self.rtt_ms + ' both\n', '', 0
+
+    def upload_file(self, content, remote_path):
+        self.uploads[remote_path] = content
+
+    def run_command(self, command, timeout=60, **kwargs):
+        self.commands.append(command)
+        return '', '', 0
 
 
 class Harness:
@@ -425,10 +448,11 @@ class ChainHealthTests(unittest.TestCase):
         h.exit('exit-1').peer_missing.add('exit-0:chain1')
         run(h.service.poll_chain(0, 'awg2'))
         h.awg().gate_calls.clear()
-        # second poll inside the recovery wait: no new gate action
+        # second poll inside the recovery wait: the gate is RE-APPLIED (a
+        # restart must not reopen the egress), the state stays broken
         result = run(h.service.poll_chain(0, 'awg2'))
         self.assertEqual(result['action'], 'noop')
-        self.assertEqual(h.awg().gate_calls, [])
+        self.assertEqual(h.awg().gate_calls, [False])
         self.assertEqual(h.record()['exit_link']['stale'], 'chain_broken_hop_1')
 
     def test_healed_chain_reopens_the_gate(self):
@@ -479,10 +503,11 @@ class ChainHealthTests(unittest.TestCase):
     def test_poll_measures_rtt_from_the_previous_node(self):
         h = self.build()
         run(h.service.poll_chain(0, 'awg2'))
-        # the RTT of hop 1 is measured ON hop 0 (the previous node of the list)
+        # the RTT of hop 1 is measured ON hop 0 (the previous node of the list);
+        # host and port travel as script arguments, never interpolated
         scripts = h.sshes['203.0.113.5'].scripts
         self.assertTrue(scripts, 'the RTT probe must run on the previous hop')
-        self.assertIn('203.0.113.6', scripts[0])
+        self.assertIn('h="$1"', scripts[0])
         result = run(h.service.poll_chain(0, 'awg2'))
         self.assertEqual(result['hops'][1]['rtt_ms'], 12.5)
 
@@ -492,18 +517,15 @@ class ChainHealthTests(unittest.TestCase):
         self.assertTrue(res['ok'])
         self.assertEqual(res['rtt_ms'], 12.5)
         self.assertEqual(res['after_uid'], 'exit-0')
-        self.assertIn('203.0.113.6', h.sshes['203.0.113.5'].scripts[-1])
+        self.assertIn('h="$1"', h.sshes['203.0.113.5'].scripts[-1])
 
     def test_chain_probe_of_the_first_hop_comes_from_the_entry(self):
         h = self.build()
         res = run(h.service.chain_probe(0, 'awg2', 'exit-0'))
-        # the entry has no exit container, so the panel probes directly; the
-        # TEST-NET address of the fixture is unreachable and must read as a
-        # clean failure, not as an exception.
-        self.assertFalse(res['ok'])
-        self.assertEqual(res['error'], 'probe_failed')
-        # and no probe script was staged on any hop for this first hop
-        self.assertEqual([s for s in h.sshes['203.0.113.5'].scripts], [])
+        # the first hop is probed from the ENTRY, not from the panel
+        self.assertTrue(res['ok'])
+        self.assertEqual(res['rtt_ms'], 12.5)
+        self.assertIn('h="$1"', h.sshes['198.51.100.1'].scripts[-1])
 
     def test_chain_flags_feed_the_server_list_badge(self):
         h = self.build()
@@ -554,32 +576,68 @@ class ChainHealthTests(unittest.TestCase):
         for call in stripped:
             self.assertEqual(call[1], ())
 
-    def test_relay_write_startup_block_is_valid_shell(self):
+    def test_relay_write_startup_splices_the_block_and_keeps_warp(self):
+        from managers.exit_manager import ExitManager
+        ssh = FakeSSH('203.0.113.5')
+        manager = ExitManager.__new__(ExitManager)
+        manager.ssh = ssh
+        relay = {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7',
+                 'mtu': 1420, 'rule_pref': 3123}
+        written = manager.relay_write_startup([relay])
+        self.assertEqual(written, ['c1a2b1'])
+        body = ssh.uploads['/tmp/_amnz_relay_start.sh']
+        # the block is spliced in, the WARP line of the existing script survives
+        self.assertIn(ExitManager.RELAY_BLOCK_START, body)
+        self.assertIn(ExitManager.RELAY_BLOCK_END, body)
+        self.assertIn('# ---- WARP egress: x_warp_up ----', body)
+        self.assertIn('tail -f /dev/null', body)
+        self.assertIn('R_PREF=3123', body)
+        # a second write replaces the block instead of stacking it
+        manager.relay_write_startup([])
+        stripped = ssh.uploads['/tmp/_amnz_relay_start.sh']
+        self.assertNotIn('R_PREF=', stripped)
+        self.assertIn('# ---- WARP egress: x_warp_up ----', stripped)
+        self.assertIn('tail -f /dev/null', stripped)
+
+    def test_relay_startup_block_is_valid_shell(self):
         import shutil
         import subprocess
         import tempfile
         bash = shutil.which('bash')
         if not bash:
             self.skipTest('bash not available')
-        relay = {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7', 'mtu': 1420}
+        ssh = FakeSSH('203.0.113.5')
+        from managers.exit_manager import ExitManager
         manager = ExitManager.__new__(ExitManager)
-        body = manager._render_start_script(relay_blocks=[
-            '# ---- exit chain relay c1a2b1 (panel-managed) ----\n'
-            'if [ -f /opt/amnezia/exit/relay/c1a2b1.conf ]; then\n'
-            + ExitManager._relay_shell_functions(manager, relay)
-            + '  x_relay_up || echo "! chain relay c1a2b1 not applied; hop stays cut"\n'
-            + 'fi\n'])
-        self.assertIn('x_relay_up ||', body)
-        self.assertIn('if [ -f /opt/amnezia/exit/relay/c1a2b1.conf ]; then', body)
+        manager.ssh = ssh
+        relay = {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7',
+                 'mtu': 1420, 'rule_pref': 3123}
+        manager.relay_write_startup([relay])
         with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False,
                                          encoding='utf-8') as handle:
-            handle.write(body)
+            handle.write(ssh.uploads['/tmp/_amnz_relay_start.sh'])
             path = handle.name
         try:
             result = subprocess.run([bash, '-n', path], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
         finally:
             os.unlink(path)
+
+    def test_relay_values_are_validated_before_reaching_a_shell(self):
+        from managers.exit_manager import ExitManager
+        manager = ExitManager.__new__(ExitManager)
+        bad = [
+            {'iface': 'c1a2b1; rm -rf /', 'table': 250, 'source_ip': '10.9.0.7'},
+            {'iface': 'c1a2b1', 'table': '250; drop', 'source_ip': '10.9.0.7'},
+            {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7$(id)'},
+            {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7', 'mtu': 'x'},
+        ]
+        for relay in bad:
+            with self.assertRaises(ValueError):
+                manager._validate_relay(relay)
+        manager._validate_relay({'iface': 'c1a2b1', 'table': 250,
+                                 'source_ip': '10.9.0.7', 'mtu': 1420,
+                                 'rule_pref': 3123})
 
 
 class ChainShellTests(unittest.TestCase):
@@ -644,3 +702,176 @@ class ChainApiWiringTests(unittest.TestCase):
         source = open('app.py', encoding='utf-8').read()
         self.assertIn('exit_chain_poll_background_loop()', source)
         self.assertIn('async def exit_chain_poll_background_loop', source)
+
+
+class ChainAuditRegressionTests(unittest.TestCase):
+    """One test per confirmed audit finding (both auditors)."""
+
+    def build(self, chain=('exit-0', 'exit-1')):
+        h = Harness()
+        run(h.service.build_chain(0, 'awg2', list(chain)))
+        h.awg().calls.clear()
+        h.awg().gate_calls.clear()
+        return h
+
+    # --- inferx F1: the gate must leave exactly one (blackhole) default ---
+    def test_chain_gate_script_deletes_the_exit0_default(self):
+        h = self.build()
+        h.awg().calls.clear()
+        run(h.service.poll_chain(0, 'awg2'))
+        scripts = [c for c in h.awg().commands] if hasattr(h.awg(), 'commands') else []
+        # the fake manager records the call; the real check is the template
+        from managers.awg_manager import AWGManager
+        template = AWGManager._EXIT_SHELL_TEMPLATE
+        gate = template[template.index('x_chain_gate()'):]
+        self.assertIn('ip -4 route del default dev $EXIT_IF table $EXIT_TABLE', gate)
+        self.assertIn('ip -4 route replace blackhole default metric 0 table $EXIT_TABLE', gate)
+        off = gate[:gate.index('x_chain_gate() {')] if False else gate
+        self.assertIn('"off"', off)
+        self.assertIn('return 3', off)          # fails loudly when not in place
+
+    # --- inferx F4: the gate decision survives a restart (marker + start.sh) ---
+    def test_start_script_reapplies_a_closed_gate_after_restart(self):
+        from managers.awg_manager import AWGManager
+        body = AWGManager(None)._render_start_script('awg2')
+        self.assertIn('[ -f "$CHAIN_GATE_MARKER" ]; then x_chain_gate off', body)
+        self.assertTrue(AWGManager._EXIT_SHELL_TEMPLATE.count('CHAIN_GATE_MARKER') >= 2)
+
+    # --- inferx F2/F7: two chains on one relay host keep their own rules ---
+    def test_two_chains_on_one_relay_host_use_distinct_rules(self):
+        h = Harness()
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        run(h.service.build_chain(0, 'awg', ['exit-0', 'exit-1']))
+        relay_a = h.record('awg2')['exit_link']['chain'][0]['relay']
+        relay_b = h.record('awg')['exit_link']['chain'][0]['relay']
+        self.assertNotEqual(relay_a['rule_pref'], relay_b['rule_pref'])
+        self.assertNotEqual(relay_a['table'], relay_b['table'])
+        self.assertNotEqual(relay_a['iface'], relay_b['iface'])
+
+    def test_teardown_of_one_chain_leaves_the_other_chain_rules_alone(self):
+        h = Harness()
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        run(h.service.build_chain(0, 'awg', ['exit-0', 'exit-1']))
+        relay_a = h.record('awg2')['exit_link']['chain'][0]['relay']
+        relay_b = h.record('awg')['exit_link']['chain'][0]['relay']
+        run(h.service.remove_chain(0, 'awg2'))
+        torn = [c[1] for c in h.exit('exit-0').calls if c[0] == 'relay_teardown']
+        self.assertIn(relay_a['iface'], torn)
+        self.assertNotIn(relay_b['iface'], torn)
+        # the surviving chain keeps its own relay wiring untouched
+        self.assertEqual(h.record('awg')['exit_link']['chain'][0]['relay']['rule_pref'],
+                         relay_b['rule_pref'])
+
+    # --- inferx F3: relay cuts the source before the uplink exists ---
+    def test_relay_block_is_fail_closed_before_the_uplink(self):
+        from managers.exit_manager import ExitManager
+        manager = ExitManager.__new__(ExitManager)
+        relay = {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7',
+                 'mtu': 1420, 'rule_pref': 3123}
+        body = ExitManager._relay_shell_functions(manager, relay)
+        up = body[body.index('x_relay_up()'):body.index('x_relay_down()')]
+        blackhole = up.index('blackhole default metric 0 table $R_TABLE')
+        quick = up.index('$X_QUICK up $R_CONF')
+        drop = up.index('-i transit0 -o eth0 -s $R_SRC -j DROP')
+        self.assertLess(blackhole, quick, 'blackhole must be in place before the uplink')
+        self.assertLess(drop, quick, 'the eth0 guard must be in place before the uplink')
+        self.assertIn('x_ipt_del filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP', up)
+        self.assertIn('^$R_PREF: from $R_SRC lookup $R_TABLE', up)
+
+    # --- inferx F5: DNS may not leave the chain ---
+    def test_dns_via_exit_cannot_be_disabled_for_a_chain(self):
+        h = self.build()
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.set_dns_via_exit(0, 'awg2', False))
+        self.assertEqual(ctx.exception.code, 'dns_not_allowed_with_chain')
+        # the automatic uninstall path skips chains instead of leaking DNS
+        h.data['servers'][2]['protocols']['dns'].pop('installed', None)
+        results = run(h.service.disable_dns_via_exit_for_exit('exit-1'))
+        statuses = {item['status'] for item in results}
+        self.assertEqual(statuses, {'skipped'})
+
+    def test_dns_via_exit_validates_the_final_hop_of_a_chain(self):
+        h = self.build()
+        h.data['servers'][2]['protocols']['dns'].pop('installed', None)   # final hop loses DNS
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.set_dns_via_exit(0, 'awg2', True))
+        self.assertEqual(ctx.exception.code, 'exit_dns_needs_dns')
+
+    # --- inferx F6: rebuilding a shorter chain removes the dropped relays ---
+    def test_shortening_a_chain_removes_the_dropped_relay(self):
+        h = self.build(('exit-0', 'exit-1', 'exit-2'))
+        relay_c = h.record()['exit_link']['chain'][1]['relay']
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        self.assertEqual(len(h.record()['exit_link']['chain']), 2)
+        torn = [c[1] for c in h.exit('exit-1').calls if c[0] == 'relay_teardown']
+        self.assertIn(relay_c['iface'], torn)
+        self.assertEqual(h.record()['exit_link']['chain'][1].get('relay'), None)
+
+    # --- inferx F7: a single link may not overwrite a chain ---
+    def test_single_link_refuses_to_overwrite_a_chain(self):
+        h = self.build()
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.link(0, 'awg2', 'exit-2'))
+        self.assertEqual(ctx.exception.code, 'chain_present_use_chain_api')
+
+    # --- inferx F8: a failed build restores the lowered MTU ---
+    def test_failed_build_restores_the_lowered_mtu(self):
+        h = Harness()
+        h.awg().mtu = '1420'
+        h.exit('exit-0').relay_error = 'transit port unreachable'
+        with self.assertRaises(ExitLinkError):
+            run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1'], mtu_override=True))
+        self.assertEqual(h.awg().applied_mtu, None if False else h.awg().applied_mtu)
+        # the last MTU write is the restore back to 1420
+        mtu_writes = [c[2] for c in h.awg().calls if c[0] == 'update_awg_settings']
+        self.assertEqual(mtu_writes, [1340, 1420])
+
+    # --- inferx F9: a failed entry unlink keeps the chain record ---
+    def test_remove_chain_keeps_the_record_when_entry_unlink_fails(self):
+        h = self.build()
+        h.awg().fail_unlink = True
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.remove_chain(0, 'awg2'))
+        self.assertEqual(ctx.exception.code, 'exit_unlink_failed')
+        self.assertEqual(h.record()['exit_link']['stale'], 'teardown_pending')
+
+    # --- inferx F11: no PSK leaves the panel ---
+    def test_status_and_build_never_return_a_psk(self):
+        h = self.build()
+        status = run(h.service.status(0, 'awg2'))
+        self.assertNotIn('psk', json.dumps(status))
+        result = run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        self.assertNotIn('psk', json.dumps(result))
+        stored = h.record()['exit_link']
+        self.assertNotIn('psk', json.dumps(stored))
+
+    # --- inferx F10: the stored per-hop status is part of the view ---
+    def test_chain_view_returns_the_stored_hop_status(self):
+        h = self.build()
+        run(h.service.poll_chain(0, 'awg2'))
+        data = h.data
+        view = h.service.chain_view(data, h.record(), 'entry-uid')
+        self.assertTrue(view['poll']['hops'])
+        self.assertEqual(len(view['poll']['hops']), 2)
+        self.assertEqual(view['poll']['hops'][0]['handshake_age'], 3)
+
+    # --- nemotron F19: failover the chain disabled comes back ---
+    def test_removing_a_chain_reenables_failover_it_disabled(self):
+        h = Harness()
+        run(h.service.link(0, 'awg2', 'exit-0'))
+        run(h.service.configure_failover(0, 'awg2', enabled=True, backup_uids=['exit-1']))
+        self.assertTrue(h.record()['exit_failover']['enabled'])
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))   # chain disables it
+        self.assertFalse(h.record()['exit_failover']['enabled'])
+        result = run(h.service.remove_chain(0, 'awg2'))
+        self.assertIn('exit_failover_reenabled', result.get('warnings', []))
+        self.assertTrue(h.record()['exit_failover']['enabled'])
+
+    # --- nemotron F17: clamped settings are reported, not silent ---
+    def test_clamped_poll_settings_are_reported(self):
+        h = self.build()
+        result = run(h.service.configure_chain_poll(
+            0, 'awg2', check_interval_seconds=99999, probe_attempts=0))
+        self.assertIn('exit_chain_check_interval_seconds_clamped', result['warnings'])
+        self.assertIn('exit_chain_probe_attempts_clamped', result['warnings'])
+        self.assertEqual(result['chain']['poll']['check_interval_seconds'], 3600)

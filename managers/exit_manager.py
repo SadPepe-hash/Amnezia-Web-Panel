@@ -9,6 +9,7 @@ own paths, one fixed instance and a peers table instead of a clients table.
 
 import ipaddress
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -19,6 +20,7 @@ from managers.awg_manager import (
     generate_awg_params,
     generate_psk,
     _IP_RULE_HELPERS,
+    IPV4_RE,
 )
 import warp_service as warp_logic
 
@@ -129,7 +131,7 @@ class ExitManager(AWGManager):
         return f"{net.network_address + 1}/{net.prefixlen}"
 
     def _render_start_script(self, protocol_type=None, config_path=None,
-                             warp_ctx=None, relay_blocks=()):
+                             warp_ctx=None):
         net = ipaddress.ip_network(EXIT_DEFAULTS['subnet'])
         pre_blocks = ()
         extra_blocks = (self._mss_clamp_body(self.INTERFACE),)
@@ -160,34 +162,8 @@ class ExitManager(AWGManager):
             self._subnet_gateway(net),
             self._bwlimits_path(),
             pre_blocks=pre_blocks,
-            extra_blocks=tuple(extra_blocks) + tuple(relay_blocks),
+            extra_blocks=extra_blocks,
         )
-
-    def relay_write_startup(self, relays):
-        """Rewrite start.sh of the exit container so every relay uplink of
-        `relays` comes back after a restart. No restart: the running tunnels
-        are untouched (the entry link does the same)."""
-        blocks = []
-        for relay in relays or []:
-            iface = relay['iface']
-            conf = f'/opt/amnezia/exit/relay/{iface}.conf'
-            blocks.append(
-                f'# ---- exit chain relay {iface} (panel-managed) ----\n'
-                f'if [ -f {conf} ]; then\n'
-                + self._relay_shell_functions(relay)
-                + f'  x_relay_up || echo "! chain relay {iface} not applied; hop stays cut"\n'
-                + 'fi\n')
-        body = self._render_start_script(relay_blocks=blocks)
-        self.ssh.upload_file(body, '/tmp/_amnz_relay_start.sh')
-        try:
-            for step in (f'docker cp /tmp/_amnz_relay_start.sh {self.CONTAINER_NAME}:/opt/amnezia/start.sh',
-                         f'docker exec -i {self.CONTAINER_NAME} chmod +x /opt/amnezia/start.sh'):
-                out, err, code = self.ssh.run_sudo_command(step)
-                if code != 0:
-                    raise RuntimeError(f'Failed to write start.sh: {err or out}')
-        finally:
-            self.ssh.run_command('rm -f /tmp/_amnz_relay_start.sh')
-        return [relay['iface'] for relay in relays or []]
 
     def _transit_config(self, port, net, awg_params):
         """transit0.conf. Panel metadata lives inside [Interface] as comments
@@ -551,6 +527,35 @@ fi
     RELAY_DIR = '/opt/amnezia/exit/relay'
     RELAY_TABLE_BASE = 210
     RELAY_TABLE_RANGE = 500
+    RELAY_PREF_BASE = 3000
+    RELAY_PREF_RANGE = 500
+    RELAY_IFACE_RE = re.compile(r'^c[0-9a-f]{4}[0-9]{1,3}$')
+    RELAY_BLOCK_START = '# >>> exit-chain-relays >>>'
+    RELAY_BLOCK_END = '# <<< exit-chain-relays <<<'
+
+    @staticmethod
+    def _validate_relay(relay):
+        """Relay wiring is panel-generated, but data.json can be restored or
+        hand-edited: refuse anything that is not a plain iface/table/src/mtu
+        before it reaches a root shell inside the container."""
+        iface = relay.get('iface')
+        table = relay.get('table')
+        source_ip = relay.get('source_ip')
+        mtu = relay.get('mtu', 1420)
+        if not isinstance(iface, str) or not ExitManager.RELAY_IFACE_RE.match(iface):
+            raise ValueError(f'invalid relay interface: {iface!r}')
+        if not isinstance(table, int) or isinstance(table, bool) \
+                or not (200 < table < 1000):
+            raise ValueError(f'invalid relay routing table: {table!r}')
+        if not isinstance(source_ip, str) or not IPV4_RE.match(source_ip):
+            raise ValueError(f'invalid relay source address: {source_ip!r}')
+        if not isinstance(mtu, int) or isinstance(mtu, bool) \
+                or not (1280 <= mtu <= 1420):
+            raise ValueError(f'invalid relay MTU: {mtu!r}')
+        pref = relay.get('rule_pref')
+        if pref is not None and (not isinstance(pref, int) or isinstance(pref, bool)
+                                 or not (3000 <= pref < 4000)):
+            raise ValueError(f'invalid relay rule preference: {pref!r}')
 
     @staticmethod
     def relay_conf_path(relay):
@@ -571,41 +576,73 @@ fi
             table += 1
         return table
 
+    @classmethod
+    def relay_pref_for(cls, prefix, index, taken=()):
+        """Deterministic ip-rule preference per (chain prefix, hop index).
+
+        A shared preference would make the second chain on a relay host a no-op
+        and let one teardown delete another chain's rule, so every relay owns
+        its own slot (verified in x_relay_up)."""
+        import zlib
+        base = cls.RELAY_PREF_BASE + (
+            zlib.crc32(f'{prefix}:{index}'.encode('utf-8')) % cls.RELAY_PREF_RANGE)
+        pref = base
+        while pref in (taken or ()):
+            pref += 1
+        return pref
+
     @staticmethod
     def relay_iface_for(prefix, index):
         return f'c{prefix}{index}'
 
     def _relay_shell_functions(self, relay):
         """Shell functions for one relay uplink (no side effects alone)."""
+        self._validate_relay(relay)
         iface = relay['iface']
         table = relay['table']
+        pref = relay.get('rule_pref')
+        if pref is None:
+            pref = self.relay_pref_for(iface, table)
         return (
             f"R_IF={iface}\n"
             f"R_CONF=/opt/amnezia/exit/relay/{iface}.conf\n"
             f"R_KEY=/opt/amnezia/exit/relay/{iface}_private.key\n"
             f"R_TABLE={table}\n"
+            f"R_PREF={pref}\n"
             f"R_SRC={relay['source_ip']}\n"          # /32 of the previous hop on transit0
             f"R_MTU={relay.get('mtu', 1420)}\n"
             "X_QUICK=awg-quick\n"                     # same binary inside the exit container
             f"{_IP_RULE_HELPERS}"
             "x_relay_up() {\n"
-            "  $X_QUICK down $R_CONF 2>/dev/null; $X_QUICK up $R_CONF || { echo \"! $R_IF failed to start; chain hop stays cut\"; return 3; }\n"
+            # Fail-closed BEFORE the uplink exists: traffic of the previous hop
+            # must never leave through this node's own eth0 while the tunnel is
+            # down, not even for a moment.
+            "  ip -4 route replace blackhole default metric 0 table $R_TABLE\n"
+            "  x_ipt_add filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP\n"
+            "  $X_QUICK down $R_CONF 2>/dev/null\n"
+            "  $X_QUICK up $R_CONF || { echo \"! $R_IF failed to start; chain hop stays cut\"; return 3; }\n"
             "  sysctl -w net.ipv4.conf.$R_IF.rp_filter=2 >/dev/null 2>&1 || true\n"
-            "  ip -4 route replace blackhole default metric 1000 table $R_TABLE\n"
+            # the real default replaces the blackhole (same key, one route only)
             "  ip -4 route replace default dev $R_IF table $R_TABLE\n"
-            "  x_rule -4 3000 from $R_SRC lookup $R_TABLE\n"
+            "  x_rule -4 $R_PREF from $R_SRC lookup $R_TABLE\n"
             "  x_ipt_add filter FORWARD -i transit0 -o $R_IF -s $R_SRC -j ACCEPT\n"
             "  x_ipt_add nat POSTROUTING -s $R_SRC -o $R_IF -j MASQUERADE\n"
             "  x_ipt_add mangle FORWARD -o $R_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
+            # the uplink is verified: the DROP guard is not needed any more
+            "  x_ipt_del filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP\n"
             "  if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $R_SRC >/dev/null 2>&1; fi\n"
             "  if ! ip -4 route show table $R_TABLE | grep -q \"^default dev $R_IF\" || ! iptables -t nat -C POSTROUTING -s $R_SRC -o $R_IF -j MASQUERADE 2>/dev/null; then\n"
             "    echo \"! FATAL: relay routing for $R_IF is not in place\"; return 3; fi\n"
-            "  echo \"relay up: $R_SRC via $R_IF -> table $R_TABLE\"\n"
+            "  if ! ip -4 rule show | grep -q \"^$R_PREF: from $R_SRC lookup $R_TABLE\"; then\n"
+            "    echo \"! FATAL: policy rule for $R_SRC is not in place\"; return 3; fi\n"
+            "  echo \"relay up: $R_SRC via $R_IF -> table $R_TABLE pref $R_PREF\"\n"
             "}\n"
             "x_relay_down() {\n"
             "  [ -f \"$R_CONF\" ] && $X_QUICK down $R_CONF 2>/dev/null; ip link del $R_IF 2>/dev/null\n"
-            "  x_unrule -4 3000\n"
+            # cut first, then clean up: no window where the source can use eth0
+            "  x_unrule -4 $R_PREF\n"
             "  ip -4 route flush table $R_TABLE 2>/dev/null\n"
+            "  x_ipt_del filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP\n"
             "  x_ipt_del filter FORWARD -i transit0 -o $R_IF -s $R_SRC -j ACCEPT\n"
             "  x_ipt_del nat POSTROUTING -s $R_SRC -o $R_IF -j MASQUERADE\n"
             "  x_ipt_del mangle FORWARD -o $R_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu\n"
@@ -614,6 +651,7 @@ fi
 
     def relay_prepare_keys(self, relay):
         """Key pair of the relay's own uplink, kept inside the container."""
+        self._validate_relay(relay)
         iface = relay['iface']
         out, err, code = self.ssh.run_sudo_command(
             f"docker exec -i {self.CONTAINER_NAME} bash -c 'umask 077; mkdir -p /opt/amnezia/exit/relay; "
@@ -626,6 +664,7 @@ fi
 
     def relay_write_conf(self, relay, link):
         """Write exit<i>.conf of the relay; the private key never leaves the box."""
+        self._validate_relay(relay)
         iface = relay['iface']
         lines = [
             '[Interface]',
@@ -661,6 +700,7 @@ fi
 
     def relay_apply(self, relay, teardown=False):
         """Apply the relay uplink live inside the container."""
+        self._validate_relay(relay)
         iface = relay['iface']
         functions = self._relay_shell_functions(relay)
         action = 'x_relay_down\n' if teardown else 'x_relay_up\n'
@@ -679,6 +719,7 @@ fi
 
     def relay_teardown(self, relay):
         """Take the uplink down and drop its file so start.sh stays inert."""
+        self._validate_relay(relay)
         iface = relay['iface']
         try:
             self.relay_apply(relay, teardown=True)
@@ -689,6 +730,11 @@ fi
 
     def relay_status(self, relay, now=None):
         """Handshake age and counters of one relay uplink (no exceptions)."""
+        try:
+            self._validate_relay(relay)
+        except ValueError as err:
+            return {'iface': relay.get('iface'), 'up': False, 'handshake_age': None,
+                    'rx_bytes': 0, 'tx_bytes': 0, 'error': str(err)}
         iface = relay['iface']
         result = {'iface': iface, 'up': False, 'handshake_age': None,
                   'rx_bytes': 0, 'tx_bytes': 0, 'error': None}
@@ -709,37 +755,62 @@ fi
                     handshake = peer.get('latest_handshake') or 0
                     result['handshake_age'] = (
                         None if not handshake else max(0, int((now or time.time()) - handshake)))
+            # "up" means the policy rule AND the uplink default are both in
+            # place: a route alone is the false positive the chain poll must not
+            # trust (the previous hop could be using the main table).
+            rule, _err, _code = self.ssh.run_sudo_command(
+                f"docker exec -i {self.CONTAINER_NAME} ip -4 rule show 2>/dev/null")
             route, _err, _code = self.ssh.run_sudo_command(
                 f"docker exec -i {self.CONTAINER_NAME} ip -4 route show table {relay['table']} 2>/dev/null")
+            pref = relay.get('rule_pref')
             result['route_ok'] = f"default dev {iface}" in (route or '')
-            result['up'] = bool(result.get('route_ok'))
+            result['rule_ok'] = bool(
+                pref and f"{pref}: from {relay['source_ip']} lookup {relay['table']}" in (rule or ''))
+            result['up'] = bool(result.get('route_ok')) and bool(result.get('rule_ok'))
         except Exception as err:  # a dead relay is a fact, not a crash
             result['error'] = str(err)
         return result
 
-    def transit_status(self, peer_id=None, now=None):
-        """Handshake/transfer of the transit link (the one facing the entry or
-        the previous hop). `peer_id` narrows it to one peer of the table."""
-        result = {'up': False, 'handshake_age': None, 'rx_bytes': 0, 'tx_bytes': 0}
+    def relay_write_startup(self, relays):
+        """Make every relay uplink of `relays` survive a restart.
+
+        The block is spliced into the EXISTING start.sh of the container between
+        markers (never re-rendered), so a WARP egress block or any other local
+        content of that host is preserved.
+        """
+        for relay in relays or []:
+            self._validate_relay(relay)
+        blocks = []
+        for relay in relays or []:
+            iface = relay['iface']
+            conf = f'/opt/amnezia/exit/relay/{iface}.conf'
+            blocks.append(
+                f'# ---- exit chain relay {iface} (panel-managed) ----\n'
+                f'if [ -f {conf} ]; then\n'
+                + self._relay_shell_functions(relay)
+                + f'  x_relay_up || echo "! chain relay {iface} not applied; hop stays cut"\n'
+                + 'fi\n')
+        block = (f'{self.RELAY_BLOCK_START}\n' + ''.join(blocks)
+                 + f'{self.RELAY_BLOCK_END}\n')
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {self.CONTAINER_NAME} cat /opt/amnezia/start.sh")
+        if code != 0:
+            raise RuntimeError(f'Failed to read start.sh: {err or out}')
+        body = re.sub(re.escape(self.RELAY_BLOCK_START) + r'.*?' +
+                      re.escape(self.RELAY_BLOCK_END) + r'\n?',
+                      '', out or '', flags=re.S)
+        if blocks:
+            if 'tail -f /dev/null' in body:
+                body = body.replace('tail -f /dev/null', block + '\ntail -f /dev/null')
+            else:
+                body = body.rstrip('\n') + '\n' + block
+        self.ssh.upload_file(body, '/tmp/_amnz_relay_start.sh')
         try:
-            out, _err, code = self.ssh.run_sudo_command(
-                f"docker exec -i {self.CONTAINER_NAME} sh -c 'awg show {self.INTERFACE} latest-handshakes; "
-                f"echo ---; awg show {self.INTERFACE} transfer; echo ---; awg show {self.INTERFACE} endpoints'"
-            )
-            if code == 0 and out.strip():
-                peers = self._parse_wg_peer_lists(out)
-                for pub, peer in peers.items():
-                    if peer_id and pub and peer_id not in pub:
-                        continue
-                    handshake = peer.get('latest_handshake') or 0
-                    result.update({
-                        'up': True,
-                        'rx_bytes': peer.get('rx_bytes') or 0,
-                        'tx_bytes': peer.get('tx_bytes') or 0,
-                        'handshake_age': (None if not handshake
-                                          else max(0, int((now or time.time()) - handshake))),
-                    })
-                    break
-        except Exception as err:  # pragma: no cover - SSH failure is not fatal here
-            result['error'] = str(err)
-        return result
+            for step in (f'docker cp /tmp/_amnz_relay_start.sh {self.CONTAINER_NAME}:/opt/amnezia/start.sh',
+                         f'docker exec -i {self.CONTAINER_NAME} chmod +x /opt/amnezia/start.sh'):
+                out, err, code = self.ssh.run_sudo_command(step)
+                if code != 0:
+                    raise RuntimeError(f'Failed to write start.sh: {err or out}')
+        finally:
+            self.ssh.run_command('rm -f /tmp/_amnz_relay_start.sh')
+        return [relay['iface'] for relay in relays or []]

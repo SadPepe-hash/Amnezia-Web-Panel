@@ -5546,8 +5546,9 @@
     let currentExitLinkState = null;
     const EXIT_LINK_ERROR_KEYS = ['exit_no_handshake', 'exit_mtu_too_big', 'exit_self', 'exit_legacy_obfuscation',
         'exit_not_found', 'exit_apply_failed', 'exit_in_use', 'exit_egress_failed', 'exit_dns_needs_dns',
-        'not_linked', 'failover_no_backups', 'exit_link_ipv6',
+        'not_linked', 'failover_no_backups', 'exit_link_ipv6', 'exit_unlink_failed',
         'chain_empty', 'chain_too_long', 'chain_duplicate_node', 'chain_mtu_override_required',
+        'chain_present_use_chain_api', 'dns_not_allowed_with_chain',
         'failover_not_allowed_with_chain'];
     let currentExitFailoverBackups = [];
     let currentExitNodes = [];
@@ -5621,6 +5622,18 @@
         // A chain may never be silently repaired by failover.
         document.getElementById('exitFailoverGroup').classList.toggle('hidden', chainMode || !link);
         document.getElementById('exitDnsViaExit').checked = !!(link && link.dns_via_exit);
+        // DNS of a chained instance is resolved on the final hop: the toggle
+        // must not invite moving DNS back to the entry.
+        const dnsToggle = document.getElementById('exitDnsViaExit');
+        const dnsHint = document.getElementById('exitDnsGroup').querySelector('.form-hint');
+        if (chainMode) {
+            dnsToggle.checked = true;
+            dnsToggle.disabled = true;
+            if (dnsHint) dnsHint.textContent = _('exit_chain_dns_hint');
+        } else {
+            dnsToggle.disabled = false;
+            if (dnsHint) dnsHint.textContent = _('exit_dns_via_exit_hint');
+        }
         // Smart Route split toggle: only meaningful for a linked instance.
         const srGroup = document.getElementById('smartRouteGroup');
         const srToggle = document.getElementById('smartRouteToggle');
@@ -5868,7 +5881,7 @@
                 </tr>`).join('') + `</tbody></table></div>`;
         }
         const staleLine = view.stale
-            ? `<div class="form-hint" style="color:var(--danger,#f87171)">⚠ ${_('exit_chain_broken').replace('{n}', String(view.stale).split('_').pop())}</div>` : '';
+            ? `<div class="form-hint" style="color:var(--danger,#f87171)">⚠ ${_('exit_chain_broken').replace('{n}', escapeHtml(String(view.stale).split('_').pop()))}</div>` : '';
         box.innerHTML = staleLine + box.innerHTML;
         document.getElementById('exitChainEvents').innerHTML = events.length
             ? events.slice(0, 8).map(e => `<div>${escapeHtml(e.ts || '')} · ${escapeHtml(e.action || '')} · ${escapeHtml(e.reason || '')}</div>`).join('')
@@ -5882,15 +5895,21 @@
         const after = currentExitChain.length ? currentExitChain[currentExitChain.length - 1] : null;
         const cell = document.getElementById('exitChainAddBtn');
         cell.disabled = true;
+        let probe;
         try {
             const res = await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain/probe`, 'POST',
                                      { protocol: currentExitLinkProto, uid, after_uid: after });
-            currentExitChainProbes[uid] = { ok: res.ok, rtt_ms: res.rtt_ms };
+            probe = { ok: res.ok, rtt_ms: res.rtt_ms };
         } catch (err) {
-            currentExitChainProbes[uid] = { ok: false, rtt_ms: null };
+            probe = { ok: false, rtt_ms: null };
             showToast(_('error') + ': ' + (err.message || ''), 'error');
         } finally {
             cell.disabled = false;
+        }
+        currentExitChainProbes[uid] = probe;
+        if (!probe.ok && !confirm(_('exit_chain_probe_failed') + '\n\n' + _('exit_chain_add_anyway'))) {
+            renderExitChainRows();
+            return;
         }
         currentExitChain.push(uid);
         renderExitChainRows();

@@ -133,3 +133,44 @@ budget, DNS requirement on the final hop, validation codes, failover ban,
 legacy-link normalisation, fail-closed gate open/close/stale handshake/dead
 container, recovery wait, RTT from the previous node, teardown, repair,
 relay shell content (`bash -n` + no DNS exception) and the API wiring.
+
+## Fail-closed guarantees (after the audit fixes)
+
+Two independent audits (inferx/deepseek-v4.1-flash, nvidia/nemotron-3-ultra)
+found four critical defects in the first implementation; all are fixed and
+covered by regression tests in `ChainAuditRegressionTests`:
+
+1. **The gate must actually cut.** `x_chain_gate off` now DELETES the
+   `default dev exit0` route and leaves exactly one default - a blackhole at
+   metric 0 - and verifies the table before reporting success. A blackhole at a
+   higher metric next to the real default changes nothing (the kernel picks the
+   lower metric), which is what the first version did.
+2. **The gate is durable.** The decision is persisted as a marker file
+   (`/opt/amnezia/awg/exit/chain_gate_off`) and start.sh re-applies
+   `x_chain_gate off` at boot, so restarting the container or the host cannot
+   reopen a broken chain. The poll re-applies the gate on every pass while the
+   chain is broken.
+3. **A relay may never leak.** `x_relay_up` installs the table blackhole AND a
+   `FORWARD -i transit0 -o eth0 -s <prev /32> -j DROP` before `awg-quick up`,
+   and removes the guard only after the uplink is verified. Every relay owns its
+   routing table, its policy-rule preference and its interface name
+   (`c<prefix><i>`, table/pref = deterministic per (prefix, hop index), bumped
+   on clash), so several chains can share one relay host and a teardown cannot
+   delete another chain's rule. `relay_status` reports up only when the rule
+   AND the uplink default are both present.
+4. **DNS follows the chain.** `dns_via_exit` cannot be turned off while a chain
+   is set (`dns_not_allowed_with_chain`), enabling it validates AmneziaDNS on
+   the FINAL hop, and the automatic DNS-uninstall path skips chains.
+
+Other confirmed findings: a previous chain is torn down before a rebuild
+(shortening/reordering leaves no orphan interfaces, rules, peers or start.sh
+blocks); the single-link endpoint refuses to overwrite a chain; a lowered client
+MTU is restored when the build fails; a failed entry unlink keeps the record
+(`stale=teardown_pending`) instead of reporting a silent success; PSKs are
+never stored in the chain record nor returned by the API; relay values are
+validated (iface regex, int table/pref, IPv4 source, MTU range) before they
+reach a root shell and the RTT probe passes host/port as script arguments; the
+relay startup block is spliced into the existing start.sh (WARP blocks survive);
+the per-hop status is part of `chain_view`; failover that the chain disabled is
+re-enabled when the chain is removed; clamped poll settings are reported; the
+server-list badge refreshes every 60 s and clears itself.

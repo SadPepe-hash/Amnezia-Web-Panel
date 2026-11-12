@@ -18,6 +18,7 @@ EXIT_CONF=/opt/amnezia/awg/exit/exit0.conf
 EXIT_IF=exit0
 EXIT_TABLE=200
 EXIT_PREF=200      # slot 0: 190/191 exceptions, catch-all at the table number
+CHAIN_GATE_MARKER=/opt/amnezia/awg/exit/chain_gate_off
 DNS_NET=172.29.172.0/24
 X_CONF=/opt/amnezia/awg/wg0.conf
 X_QUICK=wg-quick
@@ -97,14 +98,30 @@ x_exit_sync() {
 }
 x_chain_gate() {
   # Fail-closed gate of the entry egress, driven by the health of the whole
-  # chain (not just this link): "off" drops clients into a blackhole instead
-  # of letting them leave via eth0, "on" restores the exit default route.
+  # chain (not just this link): "off" leaves exactly one default route in the
+  # policy table - a blackhole - and deletes the exit0 default, so nothing can
+  # fall back to eth0. "on" restores the exit0 default. A marker file makes the
+  # decision survive a container restart (start.sh re-applies it at boot).
   if [ "$1" = "off" ]; then
-    ip -4 route replace blackhole default metric 900 table $EXIT_TABLE
+    ip -4 route del default dev $EXIT_IF table $EXIT_TABLE 2>/dev/null
+    ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
+    ip -4 route replace blackhole default metric 0 table $EXIT_TABLE
+    touch "$CHAIN_GATE_MARKER"
   else
+    ip -4 route del blackhole default table $EXIT_TABLE 2>/dev/null
+    ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
     ip -4 route replace default dev $EXIT_IF table $EXIT_TABLE
+    rm -f "$CHAIN_GATE_MARKER"
   fi
   if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $X_SUBNET >/dev/null 2>&1; fi
+  # Never report success while clients could still leave via exit0
+  if [ "$1" = "off" ]; then
+    ip -4 route show table $EXIT_TABLE | grep -q "^blackhole default" || { echo "! FATAL: chain gate off is not in place"; return 3; }
+    if ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF"; then
+      echo "! FATAL: exit0 default still present while the gate is off"; return 3; fi
+  else
+    ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF" || { echo "! FATAL: exit0 default is not restored"; return 3; }
+  fi
   echo "chain gate $1: $(ip -4 route show table $EXIT_TABLE | head -1)"
 }
 [ -f "$EXIT_CONF" ] && x_killswitch_on
@@ -206,5 +223,7 @@ fi
 
 # ---- Exit-node link: bring it up now that the client tunnel exists ----
 if [ -f "$EXIT_CONF" ]; then x_link_up || echo "! exit link not applied, clients stay on the kill-switch"; fi
+# A chain that was broken before the restart must stay cut
+if [ -f "$CHAIN_GATE_MARKER" ]; then x_chain_gate off || echo "! chain gate not re-applied after restart"; fi
 
 tail -f /dev/null

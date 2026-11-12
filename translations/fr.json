@@ -1282,5 +1282,7 @@
   "exit_failover_not_allowed_with_chain": "Le basculement automatique est incompatible avec une chaîne de sortie.",
   "exit_chain_repair_confirm": "Reconstruire la chaîne ? Les tunnels des sauts redémarrent et les clients perdent le trafic quelques secondes.",
   "exit_chain_badge_broken": "chaîne rompue",
-  "exit_chain_badge_broken_hint": "La chaîne de sortie ne laisse pas passer le trafic : les clients n'ont plus Internet jusqu'à la réparation."
+  "exit_chain_badge_broken_hint": "La chaîne de sortie ne laisse pas passer le trafic : les clients n'ont plus Internet jusqu'à la réparation.",
+  "exit_chain_dns_hint": "Le DNS de la chaîne est résolu sur le dernier nœud de sortie ; cette option est indisponible.",
+  "exit_chain_add_anyway": "Ajouter ce nœud à la chaîne malgré tout ?"
 }

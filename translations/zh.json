@@ -1282,5 +1282,7 @@
   "exit_failover_not_allowed_with_chain": "自动故障切换与出口节点链不兼容。",
   "exit_chain_repair_confirm": "重建链路？各跳隧道将重启，客户端会短暂断网几秒。",
   "exit_chain_badge_broken": "链路已断开",
-  "exit_chain_badge_broken_hint": "出口链路未通流量：修复链路前，该实例的客户端没有网络。"
+  "exit_chain_badge_broken_hint": "出口链路未通流量：修复链路前，该实例的客户端没有网络。",
+  "exit_chain_dns_hint": "链路 DNS 在最后一个出口节点解析，此开关不可用。",
+  "exit_chain_add_anyway": "仍要将此节点加入链路？"
 }

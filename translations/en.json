@@ -1282,5 +1282,7 @@
   "exit_failover_not_allowed_with_chain": "Automatic failover is not available while an exit chain is set.",
   "exit_chain_repair_confirm": "Rebuild the chain? Hop tunnels will restart and clients lose traffic for a few seconds.",
   "exit_chain_badge_broken": "chain broken",
-  "exit_chain_badge_broken_hint": "The exit chain is not passing traffic: clients of this instance have no internet until the chain is repaired."
+  "exit_chain_badge_broken_hint": "The exit chain is not passing traffic: clients of this instance have no internet until the chain is repaired.",
+  "exit_chain_dns_hint": "Chain DNS is resolved on the final exit node; this toggle is not available.",
+  "exit_chain_add_anyway": "Add this node to the chain anyway?"
 }

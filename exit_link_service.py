@@ -202,12 +202,21 @@ class ExitLinkService:
         instance. Off (the default) keeps DNS on the entry node."""
         data = self.load_data()
         entry, rec = self._entry(data, entry_server_id, protocol)
+        entry_uid = entry['uid']
+        enabled = bool(enabled)
+        _record, chain = self._chain_record(data, rec)
+        if not enabled and len(chain) > 1:
+            # DNS must not leave the chain: it is resolved on the final hop
+            raise ExitLinkError('dns_not_allowed_with_chain',
+                                'DNS of a chained instance is resolved on the final '
+                                'exit node; remove the chain first')
         link = rec.get('exit_link')
         if not link:
             raise ExitLinkError('not_linked', 'This instance is not linked to an exit node')
         enabled = bool(enabled)
         if enabled:
-            exit_srv, _ = self._exit(data, link.get('exit_uid'))
+            final_uid = chain[-1]['uid'] if len(chain) > 1 else link.get('exit_uid')
+            exit_srv, _ = self._exit(data, final_uid)
             self._require_exit_dns(exit_srv)
         async with self._locks[(entry['uid'], protocol)]:
             awg = await self._awg(entry)
@@ -222,20 +231,33 @@ class ExitLinkService:
 
     async def disable_dns_via_exit_for_exit(self, exit_uid):
         """AmneziaDNS is gone from an exit node: bring the DNS of every entry
-        linked to it back home instead of leaving queries in a black hole."""
+        linked to it back home instead of leaving queries in a black hole.
+
+        A chained instance keeps its DNS on the final hop (moving it home would
+        leak it), so chains are reported and skipped."""
         results = []
         data = self.load_data()
-        for item in self.linked_entries(data, exit_uid):
-            _, rec = self._entry(data, item['server_id'], item['protocol'])
-            if not (rec.get('exit_link') or {}).get('dns_via_exit'):
-                continue
-            try:
-                await self.set_dns_via_exit(item['server_id'], item['protocol'], False)
-                results.append({**item, 'status': 'success'})
-            except Exception as err:
-                logger.warning("could not bring DNS back to entry %s/%s: %s",
-                               item['server_id'], item['protocol'], err)
-                results.append({**item, 'status': 'error', 'error': str(err)})
+        for idx, server in enumerate(data.get('servers', [])):
+            for proto, rec in (server.get('protocols') or {}).items():
+                link = (rec or {}).get('exit_link') or {}
+                if not link.get('dns_via_exit'):
+                    continue
+                if exit_uid not in chain_policy.chain_uids(link):
+                    continue
+                item = {'server_id': idx, 'protocol': proto,
+                        'name': server.get('name') or server.get('host', '')}
+                _record, chain = self._chain_record(data, rec)
+                if len(chain) > 1:
+                    results.append({**item, 'status': 'skipped',
+                                    'error': 'dns_not_allowed_with_chain'})
+                    continue
+                try:
+                    await self.set_dns_via_exit(idx, proto, False)
+                    results.append({**item, 'status': 'success'})
+                except Exception as err:
+                    logger.warning("could not bring DNS back to entry %s/%s: %s",
+                                   idx, proto, err)
+                    results.append({**item, 'status': 'error', 'error': str(err)})
         return results
 
     async def link(self, entry_server_id, protocol, exit_uid, force=False, dns_via_exit=None,
@@ -255,6 +277,11 @@ class ExitLinkService:
                 raise ExitLinkError('exit_legacy_obfuscation',
                                     'AmneziaWG Legacy can only link to a non-obfuscated exit node')
             previous = rec.get('exit_link') or {}
+            if previous.get('chain') and previous['exit_uid'] != exit_uid:
+                # replacing a chain with a single link would orphan its relays
+                raise ExitLinkError('chain_present_use_chain_api',
+                                    'This instance follows an exit-node chain; '
+                                    'edit the chain instead of linking a single exit node')
             explicit_dns = requested_dns is not None
             dns_via_exit = bool(previous.get('dns_via_exit') if requested_dns is None else requested_dns)
             peer_id = peer_id_for(entry['uid'], protocol)
@@ -643,7 +670,7 @@ class ExitLinkService:
         ipv6 = bool(await asyncio.to_thread(awg._get_subnet_ipv6_ip, protocol))
         return {
             'status': 'success',
-            'exit_link': rec.get('exit_link'),
+            'exit_link': self._public_exit_link(rec.get('exit_link')),
             'exit_link_status': link_status,
             'exit_failover': self.failover_view(data, rec, entry.get('uid')),
             'ipv6': ipv6,
@@ -1079,35 +1106,72 @@ class ExitLinkService:
 
     # ----- exit-node chain (multi-hop egress) -----
 
+    # Fields the browser may see of a stored link; PSKs stay server-side.
+    PUBLIC_LINK_FIELDS = ('exit_uid', 'exit_name', 'transit_ip', 'endpoint_host',
+                          'endpoint_port', 'obfuscation', 'dns_via_exit', 'stale',
+                          'linked_at', 'client_mtu', 'chain_prefix', 'mode',
+                          'smart_route', 'smart_route_lost', 'smart_route_prev_dns')
+
+    @classmethod
+    def _public_exit_link(cls, record):
+        """Copy of a link record without preshared keys (single or chain)."""
+        if not isinstance(record, dict):
+            return record
+        public = {key: value for key, value in record.items()
+                  if key in cls.PUBLIC_LINK_FIELDS or key == 'chain'}
+        chain = record.get('chain')
+        if isinstance(chain, list):
+            public['chain'] = [
+                {key: value for key, value in hop.items() if key != 'psk'}
+                if isinstance(hop, dict) else hop
+                for hop in chain
+            ]
+        return public
+
     @staticmethod
     def _chain_poll(rec):
-        """(config, state, events) of the chain poll of one instance."""
+        """(config, state, events, hops) of the chain poll of one instance."""
         raw = rec.get('exit_chain_poll') if isinstance(rec, dict) else None
         cfg = chain_policy.normalize_config(raw)
         state = chain_policy.normalize_state((raw or {}).get('state') if isinstance(raw, dict) else None)
         events = list((raw or {}).get('events') or []) if isinstance(raw, dict) else []
-        return cfg, state, events
+        hops = list((raw or {}).get('hops') or []) if isinstance(raw, dict) else []
+        return cfg, state, events, hops
 
     def _tables_in_use(self, data, host_uid):
-        """Relay routing tables already taken on `host_uid` by other chains."""
-        taken = set()
+        """Relay routing tables and rule preferences already taken on `host_uid`
+        by other chains, plus the transit addresses they relay."""
+        tables, prefs, sources = set(), set(), set()
         for server in data.get('servers', []):
             if server.get('uid') != host_uid:
                 continue
             for rec in (server.get('protocols') or {}).values():
                 for hop in (rec.get('exit_link') or {}).get('chain') or []:
                     relay = hop.get('relay') if isinstance(hop, dict) else None
-                    if isinstance(relay, dict) and relay.get('table'):
-                        taken.add(int(relay['table']))
-        return taken
+                    if isinstance(relay, dict):
+                        if relay.get('table'):
+                            tables.add(int(relay['table']))
+                        if relay.get('rule_pref'):
+                            prefs.add(int(relay['rule_pref']))
+                        if relay.get('source_ip'):
+                            sources.add(str(relay['source_ip']))
+        return tables, prefs, sources
 
-    def _relay_plan(self, data, hop_srv, prefix, index, source_ip):
-        """Local wiring of one relay hop: interface name, table, MTU."""
+    def _relay_plan(self, data, hop_srv, prefix, index, source_ip, skip_host_uid=None):
+        """Local wiring of one relay hop: interface name, table, rule preference.
+
+        Everything is unique per (chain prefix, hop index) and checked against
+        what other chains already use on this host, so two chains can share one
+        relay without stealing each other's rules or tables.
+        """
         from managers.exit_manager import ExitManager
-        taken = self._tables_in_use(data, hop_srv.get('uid'))
+        taken_tables, taken_prefs, _sources = self._tables_in_use(
+            data, hop_srv.get('uid'))
+        iface = ExitManager.relay_iface_for(prefix, index)
         return {
-            'iface': ExitManager.relay_iface_for(prefix, index),
-            'table': ExitManager.relay_table_for(prefix, index, taken),
+            'iface': iface,
+            'table': ExitManager.relay_table_for(prefix, index, taken_tables),
+            'rule_pref': ExitManager.relay_pref_for(prefix, index, taken_prefs),
             'source_ip': source_ip,
             'mtu': EXIT_MTU_LIMIT,
         }
@@ -1207,14 +1271,11 @@ class ExitLinkService:
             self.save_data(data)
 
     async def build_chain(self, entry_server_id, protocol, chain_uids, *, force=False,
-                          mtu_override=False, source='manual'):
+                          mtu_override=False, source='manual', _locked=False):
         """Build (or rebuild) an ordered chain of exit nodes on one instance.
 
-        The entry links to hop 0 exactly like a single exit link; every hop in
-        the middle additionally runs its own uplink towards the next hop. One
-        failure anywhere tears the whole attempt down: a half-applied chain
-        would silently leak or blackhole client traffic.
-        """
+        Dispatcher: the real work runs under the per-instance lock, unless the
+        caller already holds it (repair)."""
         data = self.load_data()
         entry, rec = self._entry(data, entry_server_id, protocol)
         entry_uid = entry['uid']
@@ -1224,195 +1285,227 @@ class ExitLinkService:
             chain_policy.validate_chain(chain_uids, entry_uid, known)
         except chain_policy.ChainError as err:
             raise ExitLinkError(err.code, err.message)
-        hops = len(chain_uids)
 
+        if _locked:
+            return await self._build_chain(entry_server_id, protocol, chain_uids,
+                                           force=force, mtu_override=mtu_override,
+                                           source=source)
         async with self._locks[(entry_uid, protocol)]:
-            data = self.load_data()
-            entry, rec = self._entry_by_uid(data, entry_uid, protocol)
-            previous = rec.get('exit_link') or {}
-            prefix = previous.get('chain_prefix') if previous.get('chain') else None
-            if hops > 1 and not prefix:
-                prefix = uuid.uuid4().hex[:4]
-            if self.protocol_base(protocol) == 'awg_legacy':
-                first_srv, first_rec = self._exit(data, chain_uids[0])
-                if first_rec.get('obfuscation'):
-                    raise ExitLinkError('exit_legacy_obfuscation',
-                                        'AmneziaWG Legacy can only link to a non-obfuscated exit node')
-            hops_count = hops
-            dns_via_exit = True if hops_count > 1 else bool(previous.get('dns_via_exit'))
-            if hops_count > 1:
-                final_srv, _ = self._exit(data, chain_uids[-1])
-                self._require_exit_dns(final_srv)
+            return await self._build_chain(entry_server_id, protocol, chain_uids,
+                                           force=force, mtu_override=mtu_override,
+                                           source=source)
 
-            awg = await self._awg(entry)
-            try:
-                mtu = int(await asyncio.to_thread(awg._get_mtu, protocol) or 0)
-            except (TypeError, ValueError):
-                mtu = 0
-            try:
-                entry_config = await asyncio.to_thread(awg._get_server_config, protocol)
-            except Exception:
-                raise ExitLinkError('state_unreadable', 'Cannot read the instance config; retry')
-            if not (entry_config or '').strip():
-                raise ExitLinkError('state_unreadable', 'Cannot read the instance config; retry')
-            ipv6 = False
-            for line in entry_config.splitlines():
-                stripped = line.strip()
-                if not stripped.startswith('Address'):
-                    continue
-                if '=' in stripped:
-                    tokens = stripped.split('=', 1)[1].split(',')
-                    ipv6 = any(':' in token for token in tokens)
-                break
-            if ipv6:
+    async def _build_chain(self, entry_server_id, protocol, chain_uids, *, force=False,
+                           mtu_override=False, source='manual'):
+        """The entry links to hop 0 exactly like a single exit link; every hop
+        in the middle additionally runs its own uplink towards the next hop.
+        One failure anywhere tears the whole attempt down: a half-applied chain
+        would silently leak or blackhole client traffic."""
+        data = self.load_data()
+        entry, rec = self._entry(data, entry_server_id, protocol)
+        previous = rec.get('exit_link') or {}
+        entry_uid = entry['uid']
+        hops = len(chain_uids)
+        prefix = previous.get('chain_prefix') if previous.get('chain') else None
+        if hops > 1 and not prefix:
+            prefix = uuid.uuid4().hex[:4]
+        if self.protocol_base(protocol) == 'awg_legacy':
+            first_srv, first_rec = self._exit(data, chain_uids[0])
+            if first_rec.get('obfuscation'):
+                raise ExitLinkError('exit_legacy_obfuscation',
+                                    'AmneziaWG Legacy can only link to a non-obfuscated exit node')
+        hops_count = hops
+        dns_via_exit = True if hops_count > 1 else bool(previous.get('dns_via_exit'))
+        if hops_count > 1:
+            final_srv, _ = self._exit(data, chain_uids[-1])
+            self._require_exit_dns(final_srv)
+
+        awg = await self._awg(entry)
+        try:
+            mtu = int(await asyncio.to_thread(awg._get_mtu, protocol) or 0)
+        except (TypeError, ValueError):
+            mtu = 0
+        try:
+            entry_config = await asyncio.to_thread(awg._get_server_config, protocol)
+        except Exception:
+            raise ExitLinkError('state_unreadable', 'Cannot read the instance config; retry')
+        if not (entry_config or '').strip():
+            raise ExitLinkError('state_unreadable', 'Cannot read the instance config; retry')
+        ipv6 = False
+        for line in entry_config.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith('Address'):
+                continue
+            if '=' in stripped:
+                tokens = stripped.split('=', 1)[1].split(',')
+                ipv6 = any(':' in token for token in tokens)
+            break
+        if ipv6:
+            raise ExitLinkError(
+                'exit_link_ipv6',
+                'Instance has IPv6 enabled; disable IPv6 before linking '
+                'to an exit node')
+        target_mtu = chain_policy.client_mtu_for_chain(hops_count)
+        warnings = []
+        mtu_lowered = False
+        if hops_count > 1 and mtu and mtu > target_mtu:
+            if not mtu_override:
                 raise ExitLinkError(
-                    'exit_link_ipv6',
-                    'Instance has IPv6 enabled; disable IPv6 before linking '
-                    'to an exit node')
-            target_mtu = chain_policy.client_mtu_for_chain(hops_count)
-            warnings = []
-            if hops_count > 1 and mtu and mtu > target_mtu:
-                if not mtu_override:
-                    raise ExitLinkError(
-                        'chain_mtu_override_required',
-                        f'Client MTU {mtu} cannot survive {hops_count} hops; '
-                        f'it must be lowered to {target_mtu}. Apply the new MTU?')
-                try:
-                    await asyncio.to_thread(awg.update_awg_settings, protocol, mtu=target_mtu)
-                except Exception as err:
-                    raise ExitLinkError('exit_apply_failed',
-                                        f'Could not lower the client MTU: {err}')
-                warnings.append('exit_chain_mtu_lowered')
-
-            built, hop_records = [], []
-            prev_uplink_pub = None
+                    'chain_mtu_override_required',
+                    f'Client MTU {mtu} cannot survive {hops_count} hops; '
+                    f'it must be lowered to {target_mtu}. Apply the new MTU?')
             try:
-                for index, uid in enumerate(chain_uids):
-                    hop_srv, hop_rec = self._exit(data, uid)
-                    if hop_srv.get('uid') == entry['uid']:
-                        raise ExitLinkError('exit_self', 'A server cannot be its own exit node')
-                    exit_manager = await self._exit_manager(hop_srv)
-                    hop_name = hop_srv.get('name') or hop_srv.get('host', '')
+                await asyncio.to_thread(awg.update_awg_settings, protocol, mtu=target_mtu)
+            except Exception as err:
+                raise ExitLinkError('exit_apply_failed',
+                                    f'Could not lower the client MTU: {err}')
+            mtu_lowered = True
+            warnings.append('exit_chain_mtu_lowered')
 
-                    # ---- incoming link: the previous node (or the entry) ----
-                    if index == 0:
-                        incoming_pub = await asyncio.to_thread(awg.exit_prepare_keys, protocol)
-                        peer_id = peer_id_for(entry_uid, protocol)
-                        peer_name = entry.get('name') or entry.get('host', '')
-                    else:
-                        incoming_pub = prev_uplink_pub
-                        peer_id = f"{chain_uids[index - 1]}:chain{index}"
-                        peer_name = f"{chain_uids[index - 1]} chain hop"
-                    if not incoming_pub:
-                        raise ExitLinkError('exit_apply_failed',
-                                            'Previous hop has no link key; rebuild the chain')
-                    peer = await asyncio.to_thread(exit_manager.add_peer, peer_id, peer_name,
-                                                   incoming_pub)
-                    if index == 0:
-                        link = {
-                            'exit_uid': uid,
-                            'transit_ip': peer['transit_ip'],
-                            'subnet_cidr': str(peer.get('subnet') or '10.9.0.0/24').split('/')[1],
-                            'exit_public_key': peer['public_key'],
-                            'psk': peer['psk'],
-                            'endpoint_host': hop_srv['host'],
-                            'endpoint_port': peer['port'] or hop_rec.get('port'),
-                            'obfuscation': bool(peer.get('obfuscation')),
-                            'awg_params': peer.get('awg_params') or {},
-                            'dns_via_exit': dns_via_exit,
-                        }
-                        await asyncio.to_thread(awg.exit_link, protocol, link)
-                        built.append({'kind': 'entry', 'awg': awg, 'exit': exit_manager,
-                                      'protocol': protocol, 'entry_uid': entry_uid})
-                        handshake = await self._wait_handshake(awg, protocol)
-                        if not handshake and not force:
-                            raise ExitLinkError('exit_no_handshake',
-                                                f'No handshake from {link["endpoint_host"]} '
-                                                f'within {HANDSHAKE_WAIT_SECONDS}s; the chain '
-                                                f'was rolled back')
-                    if index == hops_count - 1:
-                        built.append({'kind': 'final', 'exit': exit_manager, 'peer_id': peer_id})
+        # A previous chain is never left half-alive: interfaces, rules,
+        # peers and start.sh blocks of hops that are gone come down first.
+        if previous.get('chain'):
+            await self._teardown_chain(entry, protocol)
+        built, hop_records = [], []
+        prev_uplink_pub = None
+        try:
+            for index, uid in enumerate(chain_uids):
+                hop_srv, hop_rec = self._exit(data, uid)
+                if hop_srv.get('uid') == entry['uid']:
+                    raise ExitLinkError('exit_self', 'A server cannot be its own exit node')
+                exit_manager = await self._exit_manager(hop_srv)
+                hop_name = hop_srv.get('name') or hop_srv.get('host', '')
 
-                    hop_records.append({
-                        'uid': uid,
-                        'name': hop_name,
-                        'host': hop_srv.get('host', ''),
-                        'port': hop_rec.get('port'),
-                        'subnet': hop_rec.get('subnet'),
+                # ---- incoming link: the previous node (or the entry) ----
+                if index == 0:
+                    incoming_pub = await asyncio.to_thread(awg.exit_prepare_keys, protocol)
+                    peer_id = peer_id_for(entry_uid, protocol)
+                    peer_name = entry.get('name') or entry.get('host', '')
+                else:
+                    incoming_pub = prev_uplink_pub
+                    peer_id = f"{chain_uids[index - 1]}:chain{index}"
+                    peer_name = f"{chain_uids[index - 1]} chain hop"
+                if not incoming_pub:
+                    raise ExitLinkError('exit_apply_failed',
+                                        'Previous hop has no link key; rebuild the chain')
+                peer = await asyncio.to_thread(exit_manager.add_peer, peer_id, peer_name,
+                                               incoming_pub)
+                if index == 0:
+                    link = {
+                        'exit_uid': uid,
                         'transit_ip': peer['transit_ip'],
-                        'psk': peer['psk'],
+                        'subnet_cidr': str(peer.get('subnet') or '10.9.0.0/24').split('/')[1],
                         'exit_public_key': peer['public_key'],
+                        'psk': peer['psk'],
                         'endpoint_host': hop_srv['host'],
                         'endpoint_port': peer['port'] or hop_rec.get('port'),
-                        'obfuscation': bool(hop_rec.get('obfuscation')),
-                        'awg_params': hop_rec.get('awg_params') or {},
-                        'relay': None,
-                    })
+                        'obfuscation': bool(peer.get('obfuscation')),
+                        'awg_params': peer.get('awg_params') or {},
+                        'dns_via_exit': dns_via_exit,
+                    }
+                    await asyncio.to_thread(awg.exit_link, protocol, link)
+                    built.append({'kind': 'entry', 'awg': awg, 'exit': exit_manager,
+                                  'protocol': protocol, 'entry_uid': entry_uid})
+                    handshake = await self._wait_handshake(awg, protocol)
+                    if not handshake and not force:
+                        raise ExitLinkError('exit_no_handshake',
+                                            f'No handshake from {link["endpoint_host"]} '
+                                            f'within {HANDSHAKE_WAIT_SECONDS}s; the chain '
+                                            f'was rolled back')
+                if index == hops_count - 1:
+                    built.append({'kind': 'final', 'exit': exit_manager, 'peer_id': peer_id})
 
-                    # ---- this hop's own uplink towards the next one ----
-                    if index < hops_count - 1:
-                        relay = self._relay_plan(data, hop_srv, prefix, index + 1,
-                                                 peer['transit_ip'])
-                        uplink_pub = await asyncio.to_thread(exit_manager.relay_prepare_keys, relay)
-                        next_srv, next_rec = self._exit(data, chain_uids[index + 1])
-                        next_manager = await self._exit_manager(next_srv)
-                        next_peer_id = f"{uid}:chain{index + 1}"
-                        next_name = f'{hop_name} / chain hop {index + 1}'
-                        up_peer = await asyncio.to_thread(next_manager.add_peer, next_peer_id,
-                                                          next_name, uplink_pub)
-                        uplink = {
-                            'transit_ip': up_peer['transit_ip'],
-                            'subnet_cidr': str(up_peer.get('subnet') or '10.9.0.0/24').split('/')[1],
-                            'exit_public_key': up_peer['public_key'],
-                            'psk': up_peer['psk'],
-                            'endpoint_host': next_srv['host'],
-                            'endpoint_port': up_peer['port'] or next_rec.get('port'),
-                        }
-                        built.append({'kind': 'relay', 'exit': exit_manager,
-                                      'next_exit': next_manager, 'relay': relay,
-                                      'peer_id': next_peer_id})
-                        try:
-                            await asyncio.to_thread(exit_manager.relay_write_conf, relay, uplink)
-                            await asyncio.to_thread(exit_manager.relay_apply, relay)
-                        except Exception as err:
-                            raise ExitLinkError('exit_apply_failed',
-                                                f'Chain hop {index + 1} could not be brought up: {err}')
-                        status = await self._await_relay_handshake(exit_manager, relay)
-                        if not status and not force:
-                            raise ExitLinkError('exit_no_handshake',
-                                                f'No handshake on chain hop {index + 1} within '
-                                                f'{HANDSHAKE_WAIT_SECONDS}s; the chain was rolled back')
-                        hop_records[-1]['relay'] = relay
-                        prev_uplink_pub = uplink_pub
-            except Exception:
-                await self._rollback_chain(built)
-                raise
+                hop_records.append({
+                    'uid': uid,
+                    'name': hop_name,
+                    'host': hop_srv.get('host', ''),
+                    'port': hop_rec.get('port'),
+                    'subnet': hop_rec.get('subnet'),
+                    'transit_ip': peer['transit_ip'],
+                    'exit_public_key': peer['public_key'],
+                    'endpoint_host': hop_srv['host'],
+                    'endpoint_port': peer['port'] or hop_rec.get('port'),
+                    'obfuscation': bool(hop_rec.get('obfuscation')),
+                    'awg_params': hop_rec.get('awg_params') or {},
+                    'relay': None,
+                })
 
-            record = {
-                'mode': 'chain',
-                'chain_prefix': prefix,
-                'chain': hop_records,
-                'exit_uid': chain_uids[0],
-                'exit_name': hop_records[0]['name'],
-                'transit_ip': hop_records[0]['transit_ip'],
-                'exit_public_key': hop_records[0]['exit_public_key'],
-                'endpoint_host': hop_records[0]['endpoint_host'],
-                'endpoint_port': hop_records[0]['endpoint_port'],
-                'obfuscation': hop_records[0]['obfuscation'],
-                'client_mtu': target_mtu,
-                'dns_via_exit': dns_via_exit,
-                'linked_at': datetime.now().isoformat(),
-                'stale': None,
-            }
-            first_srv, _ = self._exit(data, chain_uids[0])
-            try:
-                await self._record_chain(entry, first_srv, protocol, record, source)
-            except Exception:
-                await self._rollback_chain(built)
-                raise
-            await self._refresh_relay_startup(self._relay_hosts(hop_records))
-            return {'status': 'success', 'exit_link': record,
-                    'ipv6_refused': ipv6, 'warnings': warnings}
+                # ---- this hop's own uplink towards the next one ----
+                if index < hops_count - 1:
+                    relay = self._relay_plan(data, hop_srv, prefix, index + 1,
+                                             peer['transit_ip'])
+                    uplink_pub = await asyncio.to_thread(exit_manager.relay_prepare_keys, relay)
+                    next_srv, next_rec = self._exit(data, chain_uids[index + 1])
+                    next_manager = await self._exit_manager(next_srv)
+                    next_peer_id = f"{uid}:chain{index + 1}"
+                    next_name = f'{hop_name} / chain hop {index + 1}'
+                    up_peer = await asyncio.to_thread(next_manager.add_peer, next_peer_id,
+                                                      next_name, uplink_pub)
+                    uplink = {
+                        'transit_ip': up_peer['transit_ip'],
+                        'subnet_cidr': str(up_peer.get('subnet') or '10.9.0.0/24').split('/')[1],
+                        'exit_public_key': up_peer['public_key'],
+                        'psk': up_peer['psk'],
+                        'endpoint_host': next_srv['host'],
+                        'endpoint_port': up_peer['port'] or next_rec.get('port'),
+                    }
+                    built.append({'kind': 'relay', 'exit': exit_manager,
+                                  'next_exit': next_manager, 'relay': relay,
+                                  'peer_id': next_peer_id})
+                    try:
+                        await asyncio.to_thread(exit_manager.relay_write_conf, relay, uplink)
+                        await asyncio.to_thread(exit_manager.relay_apply, relay)
+                    except Exception as err:
+                        raise ExitLinkError('exit_apply_failed',
+                                            f'Chain hop {index + 1} could not be brought up: {err}')
+                    status = await self._await_relay_handshake(exit_manager, relay)
+                    if not status and not force:
+                        raise ExitLinkError('exit_no_handshake',
+                                            f'No handshake on chain hop {index + 1} within '
+                                            f'{HANDSHAKE_WAIT_SECONDS}s; the chain was rolled back')
+                    hop_records[-1]['relay'] = relay
+                    prev_uplink_pub = uplink_pub
+        except Exception:
+            await self._rollback_chain(built)
+            if mtu_lowered and mtu:
+                # the lowered MTU is part of the failed attempt: undo it
+                awg = await self._awg(entry)
+                await self._restore_mtu(awg, protocol, mtu)
+            raise
+
+        record = {
+            'mode': 'chain',
+            'chain_prefix': prefix,
+            'chain': hop_records,
+            'exit_uid': chain_uids[0],
+            'exit_name': hop_records[0]['name'],
+            'transit_ip': hop_records[0]['transit_ip'],
+            'exit_public_key': hop_records[0]['exit_public_key'],
+            'endpoint_host': hop_records[0]['endpoint_host'],
+            'endpoint_port': hop_records[0]['endpoint_port'],
+            'obfuscation': hop_records[0]['obfuscation'],
+            'client_mtu': target_mtu,
+            'dns_via_exit': dns_via_exit,
+            'linked_at': datetime.now().isoformat(),
+            'stale': None,
+        }
+        first_srv, _ = self._exit(data, chain_uids[0])
+        try:
+            await self._record_chain(entry, first_srv, protocol, record, source)
+        except Exception:
+            await self._rollback_chain(built)
+            if mtu_lowered and mtu:
+                await self._restore_mtu(awg, protocol, mtu)
+            raise
+        await self._refresh_relay_startup(self._relay_hosts(hop_records))
+        return {'status': 'success', 'exit_link': self._public_exit_link(record),
+                'ipv6_refused': ipv6, 'warnings': warnings}
+
+    async def _restore_mtu(self, awg, protocol, mtu):
+        try:
+            await asyncio.to_thread(awg.update_awg_settings, protocol, mtu=int(mtu))
+        except Exception as err:
+            logger.warning("client MTU restore to %s failed: %s", mtu, err)
 
     async def _refresh_relay_startup(self, relays_by_host):
         """Make every relay hop come back after a container/host restart.
@@ -1454,8 +1547,30 @@ class ExitLinkService:
             if not record.get('chain'):
                 return {'status': 'success', 'unlinked': False}
             relay_hosts = self._relay_hosts(record.get('chain'))
+            # the entry must let go first: if it cannot, the record stays and
+            # the poll keeps the chain marked (a silent "removed" with clients
+            # stuck on a kill-switch is worse than an honest error)
+            try:
+                awg = await self._awg(entry)
+                await asyncio.to_thread(awg.exit_unlink, protocol)
+            except Exception as err:
+                await self._update_record(
+                    entry['uid'], protocol,
+                    lambda r: (r.get('exit_link') or {}).__setitem__('stale', 'teardown_pending'))
+                raise ExitLinkError('exit_unlink_failed',
+                                    f'Entry link could not be removed: {err}')
             await self._teardown_chain(entry, protocol)
+            failover_restored = await self._restore_failover_after_chain(entry['uid'], protocol)
             await self._update_record(entry['uid'], protocol, self._drop_link_keep_failover)
+            if failover_restored:
+                # _drop_link_keep_failover disables the poll: bring back the
+                # setting the chain had disabled
+                def reenable(r):
+                    fo = r.get('exit_failover')
+                    if isinstance(fo, dict):
+                        fo['enabled'] = True
+                        r['exit_failover'] = fo
+                await self._update_record(entry['uid'], protocol, reenable)
             # strip the relay blocks from start.sh of every hop that had one
             await self._refresh_relay_startup({uid: [] for uid in relay_hosts})
             # bring the client MTU back to the single-hop budget
@@ -1467,46 +1582,87 @@ class ExitLinkService:
                     await asyncio.to_thread(awg.update_awg_settings, protocol, mtu=target)
             except Exception as err:
                 logger.warning("could not restore the client MTU after chain removal: %s", err)
-        return {'status': 'success', 'unlinked': True}
+        result = {'status': 'success', 'unlinked': True}
+        if failover_restored:
+            result['warnings'] = ['exit_failover_reenabled']
+        return result
+
+    async def _restore_failover_after_chain(self, entry_uid, protocol):
+        """Failover that the chain disabled comes back with the chain removed."""
+        restored = False
+
+        def mutate(r):
+            nonlocal restored
+            fo = r.get('exit_failover')
+            if not isinstance(fo, dict):
+                return
+            state = failover_policy.normalize_state(fo.get('state'))
+            if state.get('last_reason') == 'chain_mode':
+                fo['enabled'] = True
+                state['last_reason'] = 'chain_removed'
+                fo['state'] = state
+                r['exit_failover'] = fo
+                restored = True
+
+        await self._update_record(entry_uid, protocol, mutate)
+        return restored
 
     async def repair_chain(self, entry_server_id, protocol):
-        """Full rebuild of the stored chain (operator action, never automatic)."""
+        """Full rebuild of the stored chain (operator action, never automatic).
+
+        The whole teardown+build runs under the instance lock so a background
+        poll or a second repair cannot probe a half-torn chain."""
         data = self.load_data()
-        _, rec = self._entry(data, entry_server_id, protocol)
+        entry, rec = self._entry(data, entry_server_id, protocol)
         record = rec.get('exit_link') or {}
         uids = chain_policy.chain_uids(record)
         if not uids:
             raise ExitLinkError('not_linked', 'This instance is not linked to an exit node')
-        await self._teardown_chain(self._entry(data, entry_server_id, protocol)[0], protocol)
-        return await self.build_chain(entry_server_id, protocol, uids, force=True,
-                                      mtu_override=True, source='repair')
+        async with self._locks[(entry['uid'], protocol)]:
+            await self._teardown_chain(entry, protocol)
+            return await self.build_chain(entry_server_id, protocol, uids, force=True,
+                                          mtu_override=True, source='repair', _locked=True)
 
     # ----- chain health: probe, poll, fail-closed gate -----
 
-    async def _probe_rtt(self, after_srv, target_srv, target_port):
-        """Reachability + latency of `target` as seen FROM `after_srv`.
+    async def _probe_rtt(self, after_srv, target_srv, target_port, entry_srv=None):
+        """Reachability + latency of `target` as seen FROM the previous node.
 
         The chain only works if each hop can reach the next one, so the check
-        is performed on the previous node of the list, not from the panel.
-        Returns (ok, rtt_ms, error_code).
+        runs on the previous node of the list (the entry for the first hop),
+        never from the panel. Returns (ok, rtt_ms, error_code).
         """
-        target_host = target_srv.get('host', '')
+        target_host = self._probe_host(target_srv)
+        if not target_host:
+            logger.warning("chain probe target has no usable host: %s", target_srv.get('name'))
+            return False, None, 'invalid_target'
         if after_srv is None:
-            return self._probe_from_panel(target_host, target_port)
+            after_srv = entry_srv
+        if after_srv is None:
+            return False, None, 'no_probe_host'
         try:
-            manager = await self._exit_manager(after_srv) if after_srv.get('protocols', {}).get(
-                'exit', {}).get('installed') else await self._awg(after_srv)
+            if (after_srv.get('protocols') or {}).get('exit', {}).get('installed'):
+                manager = await self._exit_manager(after_srv)
+            else:
+                # the entry (and any AWG-only node): the probe runs on its host
+                manager = await self._awg(after_srv)
         except Exception as err:
             logger.warning("chain probe: cannot reach %s: %s", after_srv.get('name'), err)
             return False, None, 'ssh_error'
+        # host/port are positional arguments of the staged script: nothing from
+        # data.json is interpolated into a root shell
         script = (
-            "h=%s; p=%s; rtt=\"\"; "
-            "if command -v ping >/dev/null 2>&1; then "
-            "rtt=$(ping -c1 -W2 -n $h 2>/dev/null | sed -n 's/.*time=\\([0-9.]*\\).*/\\1/p' | head -1); fi; "
-            "if [ -z \"$rtt\" ]; then "
-            "s=$(date +%%s%%N); timeout 3 bash -c \"exec 3<>/dev/tcp/$h/$p\" 2>/dev/null; rc=$?; "
-            "e=$(date +%%s%%N); if [ $rc -eq 0 ]; then rtt=$(( (e-s)/2000000 )); fi; fi; "
-            "echo \"$rtt\"" % (target_host, target_port))
+            'h="$1"; p="$2"; rtt=""; verified="no"; '
+            'case "$h" in *[!a-zA-Z0-9.:-]*) echo ""; exit 3;; esac; '
+            'case "$p" in ""|*[!0-9]*) echo ""; exit 3;; esac; '
+            'if command -v ping >/dev/null 2>&1; then '
+            "rtt=$(ping -c1 -W2 -n \"$h\" 2>/dev/null | sed -n 's/.*time=\\([0-9.]*\\).*/\\1/p' | head -1); fi; "
+            'if [ -z "$rtt" ]; then '
+            's=$(date +%s%N); timeout 3 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null; rc=$?; '
+            'e=$(date +%s%N); if [ $rc -eq 0 ]; then rtt=$(( (e-s)/1000000 )); verified="yes"; fi; '
+            'elif [ -n "$rtt" ]; then verified="ping-only"; fi; '
+            'else verified="both"; fi; '
+            'echo "$rtt $verified"')
         try:
             # a compound script: sudo covers only the first command of a plain
             # string, so the probe is staged and run as one root script.
@@ -1514,23 +1670,34 @@ class ExitLinkService:
         except Exception as err:
             logger.warning("chain probe rtt failed on %s: %s", after_srv.get('name'), err)
             return False, None, 'ssh_error'
-        value = (out or '').strip()
-        if code == 0 and value:
+        parts = (out or '').strip().split()
+        if code == 3 or not parts:
+            return False, None, 'invalid_target'
+        rtt_ms = None
+        if parts[0]:
             try:
-                return True, float(value), None
+                rtt_ms = float(parts[0])
             except ValueError:
-                return True, None, None
-        return False, None, 'probe_failed'
-
-    def _probe_from_panel(self, target_host, target_port):
-        """Panel-side fallback: TCP connect time to the transit port."""
-        import socket
-        started = time.time()
-        try:
-            with socket.create_connection((target_host, int(target_port)), timeout=3):
-                return True, round((time.time() - started) * 1000, 1), None
-        except Exception:
+                rtt_ms = None
+        verified = parts[1] if len(parts) > 1 else 'no'
+        if rtt_ms is None:
             return False, None, 'probe_failed'
+        if verified == 'ping-only':
+            # the host answers, the transit port is silent: not proven reachable
+            return True, rtt_ms, 'port_unverified'
+        return True, rtt_ms, None
+
+    @staticmethod
+    def _probe_host(server):
+        """Host the chain probe should aim at (validated, no shell input)."""
+        host = (server or {}).get('host') or ''
+        host = str(host).strip()
+        if IPV4_RE.match(host):
+            return host
+        if re.match(r'^(?=.{1,253}$)[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+                    r'(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$', host):
+            return host
+        return ''
 
     async def chain_probe(self, entry_server_id, protocol, uid, after_uid=None):
         """Availability + latency of one candidate hop, measured from the
@@ -1544,7 +1711,9 @@ class ExitLinkService:
         if after_uid:
             _, after_srv = self.find_server_by_uid(data, after_uid)
         hop_rec = ((hop_srv.get('protocols') or {}).get('exit') or {})
-        ok, rtt_ms, error = await self._probe_rtt(after_srv, hop_srv, hop_rec.get('port'))
+        # the first hop is probed from the entry itself, not from the panel
+        ok, rtt_ms, error = await self._probe_rtt(
+            after_srv, hop_srv, hop_rec.get('port'), entry_srv=entry)
         return {
             'status': 'success',
             'uid': uid,
@@ -1586,7 +1755,7 @@ class ExitLinkService:
     def chain_view(self, data, rec, entry_uid):
         """JSON-safe chain + poll state for the API/UI (no SSH)."""
         record, chain = self._chain_record(data, rec)
-        cfg, state, events = self._chain_poll(rec)
+        cfg, state, events, hops = self._chain_poll(rec)
         link = rec.get('exit_link') or {}
         nodes = {}
         for node in self.list_exit_nodes(data):
@@ -1622,7 +1791,7 @@ class ExitLinkService:
             'dns_via_exit': bool(link.get('dns_via_exit')),
             'stale': link.get('stale'),
             'linked_at': link.get('linked_at'),
-            'poll': {**cfg, 'state': state, 'events': events},
+            'poll': {**cfg, 'state': state, 'events': events, 'hops': hops},
             'failover_blocked': failover_blocked,
         }
 
@@ -1637,7 +1806,7 @@ class ExitLinkService:
             return {'action': chain_policy.ACTION_NOOP,
                     'reason': chain_policy.REASON_NOT_LINKED,
                     'entry_uid': entry.get('uid'), 'protocol': protocol}
-        cfg, state, events = self._chain_poll(rec)
+        cfg, state, events, hops = self._chain_poll(rec)
         if not cfg.get('enabled'):
             return {'action': chain_policy.ACTION_NOOP,
                     'reason': chain_policy.REASON_DISABLED,
@@ -1659,7 +1828,7 @@ class ExitLinkService:
             return {'action': chain_policy.ACTION_NOOP, 'reason': 'entry_gone',
                     'entry_uid': entry_uid, 'protocol': protocol}
         record, chain = self._chain_record(data, rec)
-        cfg, state, events = self._chain_poll(rec)
+        cfg, state, events, hops = self._chain_poll(rec)
         awg = await self._awg(entry)
         hops_result = []
         for index, hop in enumerate(chain):
@@ -1719,7 +1888,8 @@ class ExitLinkService:
                 if index > 0:
                     _, after = self.find_server_by_uid(data, chain[index - 1].get('uid'))
                 hop_rec = ((hop_srv.get('protocols') or {}).get('exit') or {})
-                ok, rtt_ms, _err = await self._probe_rtt(after, hop_srv, hop_rec.get('port'))
+                ok, rtt_ms, _err = await self._probe_rtt(
+                    after, hop_srv, hop_rec.get('port'), entry_srv=entry)
                 item['rtt_ms'] = rtt_ms
             except Exception as err:
                 logger.warning("chain rtt probe %s failed: %s", item.get('uid'), err)
@@ -1727,21 +1897,42 @@ class ExitLinkService:
         decision = chain_policy.decide(cfg, state, now, hops_result)
         state = decision['state']
         action = decision['action']
+        # "broken now" is the authoritative answer of THIS pass: a hop that just
+        # died must cut the egress even before the state machine says so.
+        broken_now = state.get('state') == chain_policy.STATE_BROKEN or not all(
+            hop.get('ok') for hop in hops_result)
 
-        if action == chain_policy.ACTION_GATE_OFF:
-            try:
+        gate_applied = None
+        try:
+            if broken_now:
+                # every poll while broken: a restart must not reopen the gate
                 await asyncio.to_thread(awg.exit_chain_gate, protocol, False)
-            except Exception as err:
-                logger.warning("chain gate off failed for %s/%s: %s", entry_uid, protocol, err)
-        elif action == chain_policy.ACTION_GATE_ON:
-            try:
+                gate_applied = False
+            elif action == chain_policy.ACTION_GATE_ON:
                 await asyncio.to_thread(awg.exit_chain_gate, protocol, True)
-            except Exception as err:
-                logger.warning("chain gate on failed for %s/%s: %s", entry_uid, protocol, err)
+                gate_applied = True
+        except Exception as err:
+            logger.warning("chain gate %s failed for %s/%s: %s",
+                           'off' if broken_now else 'on', entry_uid, protocol, err)
+            gate_applied = None
+            if broken_now:
+                # fail-closed could not be applied: say so, retry next poll
+                state['last_reason'] = 'gate_apply_failed'
+        if gate_applied is False:
+            state['gate'] = 'off'
+        elif gate_applied is True:
+            state['gate'] = 'on'
 
         stale = None
-        if state.get('state') == chain_policy.STATE_BROKEN and state.get('broken_hop_index') is not None:
+        if broken_now and state.get('broken_hop_index') is not None:
             stale = f"chain_broken_hop_{state['broken_hop_index']}"
+        elif broken_now:
+            first_bad = next((hop for hop in hops_result if not hop.get('ok')), None)
+            if first_bad is not None:
+                stale = f"chain_broken_hop_{first_bad['index']}"
+        if gate_applied is None and broken_now:
+            # the fail-closed gate could not be applied: the badge must say so
+            stale = 'chain_gate_apply_failed'
 
         def mutate(r):
             link = r.get('exit_link')
@@ -1781,7 +1972,7 @@ class ExitLinkService:
         if not chain:
             return {'action': chain_policy.ACTION_NOOP,
                     'reason': chain_policy.REASON_NOT_LINKED}
-        cfg, state, _events = self._chain_poll(rec)
+        cfg, state, _events, _hops = self._chain_poll(rec)
         if not cfg.get('enabled'):
             return {'action': chain_policy.ACTION_NOOP, 'reason': chain_policy.REASON_DISABLED}
         now = self._time()
@@ -1820,20 +2011,25 @@ class ExitLinkService:
         return results
 
     def chain_flags(self, data):
-        """Derived flags for the server list: one badge per broken chain."""
+        """Derived flags for the server list: one badge per broken chain.
+
+        A chain whose gate could not be applied counts as broken too: the
+        operator must see that the fail-closed promise is not currently kept.
+        """
         flags = {}
         for idx, server in enumerate(data.get('servers', [])):
             broken = None
             for proto, rec in (server.get('protocols') or {}).items():
                 link = (rec or {}).get('exit_link') or {}
-                if not link.get('stale'):
+                stale = str(link.get('stale') or '')
+                if not stale:
                     continue
-                if not str(link['stale']).startswith('chain_broken_hop_'):
+                if not stale.startswith('chain_broken_hop_') and stale != 'chain_gate_apply_failed':
                     continue
                 broken = {
                     'protocol': proto,
-                    'stale': link.get('stale'),
-                    'hop': str(link.get('stale')).rsplit('_', 1)[-1],
+                    'stale': stale,
+                    'hop': stale.rsplit('_', 1)[-1],
                     'server_name': server.get('name') or server.get('host', ''),
                 }
                 break
@@ -1849,12 +2045,34 @@ class ExitLinkService:
         if not chain:
             raise ExitLinkError('not_linked', 'This instance is not linked to an exit node')
         stored = rec.get('exit_chain_poll') if isinstance(rec.get('exit_chain_poll'), dict) else {}
-        merged = chain_policy.normalize_config({**stored, **{
-            key: fields[key] for key in (
-                'enabled', 'check_interval_seconds', 'probe_attempts',
-                'probe_interval_seconds', 'handshake_max_age_seconds',
-            ) if key in fields
-        }})
+        requested = {key: fields[key] for key in (
+            'enabled', 'check_interval_seconds', 'probe_attempts',
+            'probe_interval_seconds', 'handshake_max_age_seconds',
+        ) if key in fields}
+        merged = chain_policy.normalize_config({**stored, **requested})
+        # tell the operator when a value was clamped instead of silently changing it
+        warnings = []
+        bounds = {
+            'check_interval_seconds': (chain_policy.CHECK_INTERVAL_MIN,
+                                       chain_policy.CHECK_INTERVAL_MAX),
+            'probe_attempts': (chain_policy.PROBE_ATTEMPTS_MIN,
+                               chain_policy.PROBE_ATTEMPTS_MAX),
+            'probe_interval_seconds': (chain_policy.PROBE_INTERVAL_MIN,
+                                       chain_policy.PROBE_INTERVAL_MAX),
+            'handshake_max_age_seconds': (chain_policy.HANDSHAKE_MAX_AGE_SECONDS_MIN,
+                                          chain_policy.HANDSHAKE_MAX_AGE_SECONDS_MAX),
+        }
+        for key, value in requested.items():
+            if key not in bounds or value is None:
+                continue
+            low, high = bounds[key]
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                warnings.append(f'exit_chain_{key}_invalid')
+                continue
+            if number < low or number > high:
+                warnings.append(f'exit_chain_{key}_clamped')
         state = chain_policy.normalize_state(stored.get('state'))
         events = list(stored.get('events') or [])
 
@@ -1868,5 +2086,5 @@ class ExitLinkService:
         data = self.load_data()
         _, server = self.find_server_by_uid(data, entry['uid'])
         rec = ((server or {}).get('protocols') or {}).get(protocol) or {}
-        return {'status': 'success',
+        return {'status': 'success', 'warnings': warnings,
                 'chain': self.chain_view(data, rec, entry['uid'])}

@@ -115,6 +115,8 @@ EXIT_CHAIN_KEYS = {
     'chain_mtu_override_required', 'exit_failover_not_allowed_with_chain',
     'exit_chain_badge_broken', 'exit_chain_badge_broken_hint',
     'exit_chain_repair_confirm',
+    'exit_chain_dns_hint',
+    'exit_chain_add_anyway',
 }
 
 

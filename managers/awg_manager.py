@@ -173,6 +173,9 @@ EXIT_KEY = f'{EXIT_DIR}/exit_private.key'
 EXIT_IFACE = 'exit0'
 EXIT_TABLE = 200
 EXIT_MTU = 1420
+# Fail-closed marker: a broken chain must not be reopened by a restart, so
+# start.sh re-applies the gate whenever this file is present.
+EXIT_CHAIN_GATE_MARKER = f'{EXIT_DIR}/chain_gate_off'
 
 # Every AWG data packet on the wire is the client payload plus 20 (IPv4)
 # + 8 (UDP) + 32 (WireGuard transport header), and on top of that whatever
@@ -2876,6 +2879,8 @@ fi
                         + warp_pre,),
             extra_blocks=('# ---- Exit-node link: bring it up now that the client tunnel exists ----\n'
                           'if [ -f "$EXIT_CONF" ]; then x_link_up || echo "! exit link not applied, clients stay on the kill-switch"; fi\n'
+                          '# A chain that was broken before the restart must stay cut\n'
+                          'if [ -f "$CHAIN_GATE_MARKER" ]; then x_chain_gate off || echo "! chain gate not re-applied after restart"; fi\n'
                           + warp_extra,),
         )
 
@@ -2903,6 +2908,7 @@ EXIT_CONF=__EXIT_CONF__
 EXIT_IF=__EXIT_IF__
 EXIT_TABLE=__EXIT_TABLE__
 EXIT_PREF=__EXIT_TABLE__      # slot 0: 190/191 exceptions, catch-all at the table number
+CHAIN_GATE_MARKER=__CHAIN_GATE_MARKER__
 DNS_NET=__DNS_NET__
 X_CONF=__CONF__
 X_QUICK=__QUICK__
@@ -2978,14 +2984,30 @@ x_exit_sync() {
 }
 x_chain_gate() {
   # Fail-closed gate of the entry egress, driven by the health of the whole
-  # chain (not just this link): "off" drops clients into a blackhole instead
-  # of letting them leave via eth0, "on" restores the exit default route.
+  # chain (not just this link): "off" leaves exactly one default route in the
+  # policy table - a blackhole - and deletes the exit0 default, so nothing can
+  # fall back to eth0. "on" restores the exit0 default. A marker file makes the
+  # decision survive a container restart (start.sh re-applies it at boot).
   if [ "$1" = "off" ]; then
-    ip -4 route replace blackhole default metric 900 table $EXIT_TABLE
+    ip -4 route del default dev $EXIT_IF table $EXIT_TABLE 2>/dev/null
+    ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
+    ip -4 route replace blackhole default metric 0 table $EXIT_TABLE
+    touch "$CHAIN_GATE_MARKER"
   else
+    ip -4 route del blackhole default table $EXIT_TABLE 2>/dev/null
+    ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
     ip -4 route replace default dev $EXIT_IF table $EXIT_TABLE
+    rm -f "$CHAIN_GATE_MARKER"
   fi
   if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $X_SUBNET >/dev/null 2>&1; fi
+  # Never report success while clients could still leave via exit0
+  if [ "$1" = "off" ]; then
+    ip -4 route show table $EXIT_TABLE | grep -q "^blackhole default" || { echo "! FATAL: chain gate off is not in place"; return 3; }
+    if ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF"; then
+      echo "! FATAL: exit0 default still present while the gate is off"; return 3; fi
+  else
+    ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF" || { echo "! FATAL: exit0 default is not restored"; return 3; }
+  fi
   echo "chain gate $1: $(ip -4 route show table $EXIT_TABLE | head -1)"
 }
 """
@@ -2993,13 +3015,14 @@ x_chain_gate() {
     @staticmethod
     def _exit_shell_functions(config_path, quick_bin, subnet_default):
         """Shell functions of the entry side of an exit-node link (no
-        side effects by themselves): kill-switch, link up/down and the sync
-        entry point used both by start.sh and by the live apply."""
+        side effects by themselves): kill-switch, link up/down, the chain gate
+        and the sync entry point used both by start.sh and by the live apply."""
         return (AWGManager._EXIT_SHELL_TEMPLATE
                 .replace('__HELPERS__', _IP_RULE_HELPERS)
                 .replace('__EXIT_CONF__', EXIT_CONF)
                 .replace('__EXIT_IF__', EXIT_IFACE)
                 .replace('__EXIT_TABLE__', str(EXIT_TABLE))
+                .replace('__CHAIN_GATE_MARKER__', EXIT_CHAIN_GATE_MARKER)
                 .replace('__DNS_NET__', DNS_NET)
                 .replace('__CONF__', config_path)
                 .replace('__QUICK__', quick_bin)
