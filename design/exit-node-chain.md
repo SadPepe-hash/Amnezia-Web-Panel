@@ -174,3 +174,58 @@ relay startup block is spliced into the existing start.sh (WARP blocks survive);
 the per-hop status is part of `chain_view`; failover that the chain disabled is
 re-enabled when the chain is removed; clamped poll settings are reported; the
 server-list badge refreshes every 60 s and clears itself.
+
+## Second audit round (two auditors again)
+
+The re-audit found that the first fix round was itself broken; all of it is
+fixed in the second round, again with one regression test each:
+
+1. **The RTT probe never ran** (inferx N1): the script had an `else` after a
+   closed `if` (`bash -n` exit 2) and `run_sudo_script` has no argv, so `$1/$2`
+   were empty. Now: host/port are validated (IPv4/hostname regex, port range)
+   and `shlex.quote()`d into the script, the branch structure is fixed, and a
+   test runs `bash -n` on the exact string.
+2. **The rule verification could never match** (inferx N2): iproute2 prints
+   `pref:\tfrom ...` with a tab, both checks used a literal space, so
+   `x_relay_up` always returned 3 (a 2+ hop chain was unbuildable) and
+   `relay_status.rule_ok` was always False (a built chain was gated off on the
+   first poll). Now both match `[[:space:]]+`, `relay_status` parses fields.
+3. **The relay still leaked** (inferx N3): the policy rule was installed AFTER
+   `awg-quick up`, so the pre-installed blackhole was unreferenced and the
+   previous hop kept using the main table; the eth0 DROP guard was appended
+   behind the base start.sh ACCEPT (iptables is first-match) and was removed
+   before the verification. Now: rule + blackhole + `x_ipt_ins` (insert at
+   position 1) BEFORE `awg-quick up`, guard removed only after verification.
+4. **A rebuild dropped the kill-switch** (inferx N4/N5): `exit_unlink` removes
+   the rules and flushes table 200, so clients fell back to the entry's eth0
+   for the whole rebuild (and the gate could not cut: nothing pointed at
+   table 200). Now `_teardown_chain(entry_action='cut')` runs the new
+   `x_chain_cut` (interface down, kill-switch and blackhole kept) as the FIRST
+   step, and a successful build reopens the egress with `x_chain_gate on`.
+5. **The gate marker outlived the chain** (inferx N6): nothing removed
+   `chain_gate_off` when a chain was removed, so the next restart blackholed a
+   healthy single link with no poll to reopen it. Now the teardown action
+   removes the marker, and `remove_chain` unlinks the entry.
+6. **`link()` could still overwrite a chain** (inferx N8): the guard only fired
+   for a different `exit_uid`, and a chain's `exit_uid` is its first hop. Now
+   any stored chain is rejected with `chain_present_use_chain_api`.
+7. **`unlink()` bypassed the chain removal** (inferx N9/N14): it swallowed
+   entry failures, never stripped relay startup blocks, never restored the MTU
+   and left failover disabled. Now it delegates to `remove_chain` (outside its
+   own lock, which `remove_chain` re-acquires).
+8. **Relay wiring drifted on every rebuild** (inferx N10): `_relay_plan` read a
+   stale snapshot that still contained the chain being replaced, bumping
+   table/pref by one each time. Now the rebuild drops the record and re-reads
+   the store before planning, so `crc32(prefix:index)` is stable.
+9. **Legacy records had no `rule_pref`** (inferx N11): `_chain_record` fills it
+   on read, so a chain built by the first commit is not read as broken.
+10. **Cross-chain startup interference** (nemotron N1 + inferx N13): the relay
+    block was written per chain and any exit start.sh re-render dropped it. Now
+    each uplink registers `KEY=VALUE` params inside the container, the startup
+    block is spliced from that registry (the union of all chains on the host)
+    on every build/remove AND after any start.sh re-render, teardown removes
+    the entry, and the splice uses `count=1`.
+11. **Interface-name collisions** (inferx N12): `_tables_in_use` also collects
+    ifaces and `_relay_plan` regenerates the chain prefix on collision.
+12. **ping-only probes claimed success** (inferx N15): a hop whose transit port
+    never answered now reads as not reachable.

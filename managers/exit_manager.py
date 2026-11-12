@@ -602,7 +602,11 @@ fi
         table = relay['table']
         pref = relay.get('rule_pref')
         if pref is None:
-            pref = self.relay_pref_for(iface, table)
+            # legacy record without rule_pref: derive it from the iface so the
+            # check stays meaningful instead of hashing the wrong inputs
+            match = re.match(r'^c([0-9a-f]{4})([0-9]{1,3})$', str(iface))
+            if match:
+                pref = self.relay_pref_for(match.group(1), int(match.group(2)))
         return (
             f"R_IF={iface}\n"
             f"R_CONF=/opt/amnezia/exit/relay/{iface}.conf\n"
@@ -612,29 +616,32 @@ fi
             f"R_SRC={relay['source_ip']}\n"          # /32 of the previous hop on transit0
             f"R_MTU={relay.get('mtu', 1420)}\n"
             "X_QUICK=awg-quick\n"                     # same binary inside the exit container
+            "x_ipt_ins() { iptables -t \"$1\" -C \"${@:2}\" 2>/dev/null || iptables -t \"$1\" -I \"${@:2}\"; }\n"
             f"{_IP_RULE_HELPERS}"
             "x_relay_up() {\n"
-            # Fail-closed BEFORE the uplink exists: traffic of the previous hop
-            # must never leave through this node's own eth0 while the tunnel is
-            # down, not even for a moment.
+            # Fail-closed BEFORE the uplink exists: the policy rule and the
+            # blackhole must be in place first (otherwise the previous hop's
+            # traffic keeps using the main table and leaves via eth0), and the
+            # eth0 guard must be INSERTED, not appended: start.sh already has
+            # an ACCEPT for the transit subnet, and iptables is first-match.
             "  ip -4 route replace blackhole default metric 0 table $R_TABLE\n"
-            "  x_ipt_add filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP\n"
+            "  x_rule -4 $R_PREF from $R_SRC lookup $R_TABLE\n"
+            "  x_ipt_ins filter FORWARD 1 -i transit0 -o eth0 -s $R_SRC -j DROP\n"
             "  $X_QUICK down $R_CONF 2>/dev/null\n"
             "  $X_QUICK up $R_CONF || { echo \"! $R_IF failed to start; chain hop stays cut\"; return 3; }\n"
             "  sysctl -w net.ipv4.conf.$R_IF.rp_filter=2 >/dev/null 2>&1 || true\n"
             # the real default replaces the blackhole (same key, one route only)
             "  ip -4 route replace default dev $R_IF table $R_TABLE\n"
-            "  x_rule -4 $R_PREF from $R_SRC lookup $R_TABLE\n"
             "  x_ipt_add filter FORWARD -i transit0 -o $R_IF -s $R_SRC -j ACCEPT\n"
             "  x_ipt_add nat POSTROUTING -s $R_SRC -o $R_IF -j MASQUERADE\n"
             "  x_ipt_add mangle FORWARD -o $R_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
-            # the uplink is verified: the DROP guard is not needed any more
-            "  x_ipt_del filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP\n"
-            "  if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $R_SRC >/dev/null 2>&1; fi\n"
             "  if ! ip -4 route show table $R_TABLE | grep -q \"^default dev $R_IF\" || ! iptables -t nat -C POSTROUTING -s $R_SRC -o $R_IF -j MASQUERADE 2>/dev/null; then\n"
             "    echo \"! FATAL: relay routing for $R_IF is not in place\"; return 3; fi\n"
-            "  if ! ip -4 rule show | grep -q \"^$R_PREF: from $R_SRC lookup $R_TABLE\"; then\n"
+            "  if ! ip -4 rule show | grep -Eq \"^$R_PREF:[[:space:]]+from $R_SRC lookup $R_TABLE\"; then\n"
             "    echo \"! FATAL: policy rule for $R_SRC is not in place\"; return 3; fi\n"
+            # verified: the eth0 guard is not needed any more
+            "  x_ipt_del filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP\n"
+            "  if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $R_SRC >/dev/null 2>&1; fi\n"
             "  echo \"relay up: $R_SRC via $R_IF -> table $R_TABLE pref $R_PREF\"\n"
             "}\n"
             "x_relay_down() {\n"
@@ -684,9 +691,23 @@ fi
         body = '\n'.join(lines) + '\n'
         local = f"/tmp/_amnz_{iface}.conf"
         self.ssh.upload_file(body, local)
+        # The container keeps its own relay registry (KEY=VALUE per uplink), so
+        # any later re-render of start.sh can rebuild the relay blocks without
+        # the panel - and so several chains sharing this host do not overwrite
+        # each other's startup wiring.
+        params = '\n'.join([
+            f"R_IF={iface}",
+            f"R_TABLE={relay['table']}",
+            f"R_PREF={relay.get('rule_pref') or ''}",
+            f"R_SRC={relay['source_ip']}",
+            f"R_MTU={relay.get('mtu', 1420)}",
+        ]) + '\n'
+        params_local = f"/tmp/_amnz_{iface}.params"
+        self.ssh.upload_file(params, params_local)
         steps = (
             f"docker exec -i {self.CONTAINER_NAME} mkdir -p /opt/amnezia/exit/relay",
             f"docker cp {local} {self.CONTAINER_NAME}:/opt/amnezia/exit/relay/{iface}.conf",
+            f"docker cp {params_local} {self.CONTAINER_NAME}:/opt/amnezia/exit/relay/{iface}.params",
             f"docker exec -i {self.CONTAINER_NAME} bash -c 'k=$(cat /opt/amnezia/exit/relay/{iface}_private.key) && "
             f"sed -i \"s|__RELAY_KEY__|$k|\" /opt/amnezia/exit/relay/{iface}.conf && chmod 600 /opt/amnezia/exit/relay/{iface}.conf'",
         )
@@ -697,6 +718,7 @@ fi
                     raise RuntimeError(f"Failed to write {iface}.conf: {err or out}")
         finally:
             self.ssh.run_command(f"rm -f {local}")
+            self.ssh.run_command(f"rm -f {params_local}")
 
     def relay_apply(self, relay, teardown=False):
         """Apply the relay uplink live inside the container."""
@@ -718,14 +740,15 @@ fi
         return out
 
     def relay_teardown(self, relay):
-        """Take the uplink down and drop its file so start.sh stays inert."""
+        """Take the uplink down and drop its files so start.sh stays inert."""
         self._validate_relay(relay)
         iface = relay['iface']
         try:
             self.relay_apply(relay, teardown=True)
         finally:
             self.ssh.run_sudo_command(
-                f"docker exec -i {self.CONTAINER_NAME} rm -f /opt/amnezia/exit/relay/{iface}.conf")
+                f"docker exec -i {self.CONTAINER_NAME} rm -f "
+                f"/opt/amnezia/exit/relay/{iface}.conf /opt/amnezia/exit/relay/{iface}.params")
         return True
 
     def relay_status(self, relay, now=None):
@@ -764,24 +787,77 @@ fi
                 f"docker exec -i {self.CONTAINER_NAME} ip -4 route show table {relay['table']} 2>/dev/null")
             pref = relay.get('rule_pref')
             result['route_ok'] = f"default dev {iface}" in (route or '')
-            result['rule_ok'] = bool(
-                pref and f"{pref}: from {relay['source_ip']} lookup {relay['table']}" in (rule or ''))
+            result['rule_ok'] = False
+            if pref is not None:
+                # iproute2 prints "pref:\tfrom ... lookup ...": match any whitespace
+                for line in (rule or '').splitlines():
+                    parts = line.replace(':', ' ').split()
+                    if len(parts) >= 5 and parts[0] == str(pref) \
+                            and parts[1] == 'from' and parts[2] == relay['source_ip'] \
+                            and parts[3] == 'lookup' and parts[4] == str(relay['table']):
+                        result['rule_ok'] = True
+                        break
             result['up'] = bool(result.get('route_ok')) and bool(result.get('rule_ok'))
         except Exception as err:  # a dead relay is a fact, not a crash
             result['error'] = str(err)
         return result
 
-    def relay_write_startup(self, relays):
-        """Make every relay uplink of `relays` survive a restart.
+    def relay_read_registry(self):
+        """All relay uplinks this container knows about (from its own registry).
 
-        The block is spliced into the EXISTING start.sh of the container between
+        The container is the source of truth, so a chain that shares this host
+        with another chain never loses the other chain's startup block."""
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {self.CONTAINER_NAME} sh -c "
+            f"'for f in /opt/amnezia/exit/relay/*.params; do [ -e \"$f\" ] || continue; "
+            f"echo \"### $f\"; cat \"$f\"; done'"
+        )
+        relays = []
+        if code != 0:
+            return relays
+        current = {}
+        for line in (out or '').splitlines():
+            line = line.strip()
+            if line.startswith('### '):
+                if current:
+                    relays.append(current)
+                current = {}
+                continue
+            if '=' in line:
+                key, _, value = line.partition('=')
+                current[key.strip()] = value.strip()
+        if current:
+            relays.append(current)
+        cleaned = []
+        for item in relays:
+            try:
+                relay = {
+                    'iface': item['R_IF'],
+                    'table': int(item['R_TABLE']),
+                    'source_ip': item['R_SRC'],
+                    'mtu': int(item.get('R_MTU') or 1420),
+                }
+                if item.get('R_PREF'):
+                    relay['rule_pref'] = int(item['R_PREF'])
+                self._validate_relay(relay)
+            except (KeyError, TypeError, ValueError):
+                logger.warning("skipping an unreadable relay registry entry: %s", item)
+                continue
+            cleaned.append(relay)
+        return cleaned
+
+    def relay_write_startup(self, relays=None):
+        """Splice the relay blocks into start.sh so every uplink of this
+        container comes back after a restart.
+
+        Without an explicit list the container's own registry is used - the
+        union of every chain that relays here. The block is spliced between
         markers (never re-rendered), so a WARP egress block or any other local
-        content of that host is preserved.
-        """
-        for relay in relays or []:
-            self._validate_relay(relay)
+        content survives."""
+        if relays is None:
+            relays = self.relay_read_registry()
         blocks = []
-        for relay in relays or []:
+        for relay in relays:
             iface = relay['iface']
             conf = f'/opt/amnezia/exit/relay/{iface}.conf'
             blocks.append(
@@ -801,7 +877,7 @@ fi
                       '', out or '', flags=re.S)
         if blocks:
             if 'tail -f /dev/null' in body:
-                body = body.replace('tail -f /dev/null', block + '\ntail -f /dev/null')
+                body = body.replace('tail -f /dev/null', block + '\ntail -f /dev/null', 1)
             else:
                 body = body.rstrip('\n') + '\n' + block
         self.ssh.upload_file(body, '/tmp/_amnz_relay_start.sh')
@@ -813,4 +889,13 @@ fi
                     raise RuntimeError(f'Failed to write start.sh: {err or out}')
         finally:
             self.ssh.run_command('rm -f /tmp/_amnz_relay_start.sh')
-        return [relay['iface'] for relay in relays or []]
+        return [relay['iface'] for relay in relays]
+
+    def _write_start_script(self, protocol_type=None, config_path=None,
+                            warp_ctx=None):
+        """Any re-render of the exit start.sh must keep the relay blocks."""
+        super()._write_start_script(protocol_type, config_path, warp_ctx=warp_ctx)
+        try:
+            self.relay_write_startup()
+        except Exception as err:
+            logger.warning("relay startup not re-spliced after a start.sh re-render: %s", err)

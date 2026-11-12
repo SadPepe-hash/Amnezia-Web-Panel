@@ -204,7 +204,8 @@ class ExitLinkMethodsTests(unittest.TestCase):
     def test_unlink_tears_down_and_removes_the_file(self):
         self.manager.exit_unlink('awg2')
         apply_script = self.ssh.uploads['/tmp/_amnz_exit.sh']
-        self.assertTrue(apply_script.endswith('x_link_down\nx_killswitch_off\nrm -f "$EXIT_CONF"\n'))
+        self.assertTrue(apply_script.endswith(
+            'x_link_down\nx_killswitch_off\nrm -f "$EXIT_CONF" "$CHAIN_GATE_MARKER"\n'))
         self.assertNotIn('x_exit_sync\n', apply_script)
 
     def test_backup_conf_copies_exit0_aside(self):

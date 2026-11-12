@@ -2982,13 +2982,18 @@ x_exit_sync() {
   if [ -f "$EXIT_CONF" ]; then x_killswitch_on && x_link_up
   else x_link_down; x_killswitch_off; fi
 }
+x_route_defaults() { ip -4 route show table $1 2>/dev/null | grep -c "^default\|^blackhole"; }
+x_rule_has() { ip -4 rule show 2>/dev/null | grep -Eq "^$1:[[:space:]]+from $2 lookup $3"; }
 x_chain_gate() {
   # Fail-closed gate of the entry egress, driven by the health of the whole
-  # chain (not just this link): "off" leaves exactly one default route in the
+  # chain (not just this link): "off" leaves exactly ONE default route in the
   # policy table - a blackhole - and deletes the exit0 default, so nothing can
   # fall back to eth0. "on" restores the exit0 default. A marker file makes the
   # decision survive a container restart (start.sh re-applies it at boot).
   if [ "$1" = "off" ]; then
+    # without the policy rule nothing reaches the table: the gate would be a
+    # decoration, so the kill-switch rule is (re)installed first
+    x_killswitch_on
     ip -4 route del default dev $EXIT_IF table $EXIT_TABLE 2>/dev/null
     ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
     ip -4 route replace blackhole default metric 0 table $EXIT_TABLE
@@ -3002,13 +3007,25 @@ x_chain_gate() {
   if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $X_SUBNET >/dev/null 2>&1; fi
   # Never report success while clients could still leave via exit0
   if [ "$1" = "off" ]; then
+    x_rule_has $EXIT_PREF $X_SUBNET $EXIT_TABLE || { echo "! FATAL: policy rule is not in place"; return 3; }
+    [ "$(x_route_defaults $EXIT_TABLE)" = "1" ] || { echo "! FATAL: the table must hold exactly one default route"; return 3; }
     ip -4 route show table $EXIT_TABLE | grep -q "^blackhole default" || { echo "! FATAL: chain gate off is not in place"; return 3; }
-    if ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF"; then
-      echo "! FATAL: exit0 default still present while the gate is off"; return 3; fi
   else
+    [ "$(x_route_defaults $EXIT_TABLE)" = "1" ] || { echo "! FATAL: the table must hold exactly one default route"; return 3; }
     ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF" || { echo "! FATAL: exit0 default is not restored"; return 3; }
   fi
   echo "chain gate $1: $(ip -4 route show table $EXIT_TABLE | head -1)"
+}
+x_chain_cut() {
+  # Rebuild path: cut the egress of a chain that is being replaced while the
+  # kill-switch (and therefore the gate) stays in place. exit_unlink would drop
+  # the rules and flush the table, which would let clients leave via eth0 for
+  # the whole rebuild - exactly what fail-closed must not allow.
+  x_link_down
+  x_killswitch_on
+  ip -4 route replace blackhole default metric 0 table $EXIT_TABLE
+  touch "$CHAIN_GATE_MARKER"
+  echo "chain cut: egress closed for the rebuild"
 }
 """
 
@@ -3211,6 +3228,27 @@ x_warp_up() {
             raise RuntimeError(f"exit chain gate failed: {out or err or f'SSH exit code {code}'}")
         return out
 
+    def exit_chain_cut(self, protocol_type):
+        """Close the egress of a chain that is being rebuilt, keeping the
+        kill-switch (and therefore the gate) in place until the new chain is up."""
+        container_name = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        functions = self._exit_shell_functions(
+            config_path, self._quick_binary(protocol_type),
+            f"{AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}")
+        self.ssh.upload_file(functions + 'x_chain_cut\n', '/tmp/_amnz_cut.sh')
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_cut.sh {container_name}:/tmp/_amnz_cut.sh")
+        if code != 0:
+            self.ssh.run_command('rm -f /tmp/_amnz_cut.sh')
+            raise RuntimeError(f'exit chain cut failed: {err or out}')
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec {container_name} bash /tmp/_amnz_cut.sh", timeout=60)
+        self.ssh.run_command('rm -f /tmp/_amnz_cut.sh')
+        if code != 0:
+            raise RuntimeError(f"exit chain cut failed: {out or err or f'SSH exit code {code}'}")
+        return out
+
     def exit_prepare_keys(self, protocol_type):
         """Create the entry-side key pair inside the container (kept if it
         exists) and return the public key."""
@@ -3233,7 +3271,7 @@ x_warp_up() {
         functions = self._exit_shell_functions(
             config_path, self._quick_binary(protocol_type),
             f"{AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}")
-        action = ('x_link_down\nx_killswitch_off\nrm -f "$EXIT_CONF"\n' if teardown
+        action = ('x_link_down\nx_killswitch_off\nrm -f "$EXIT_CONF" "$CHAIN_GATE_MARKER"\n' if teardown
                   else 'x_exit_sync\n')
         # One docker step per sudo call: the sudo prefix covers only the first
         # command of a `&&` chain, the rest would run unprivileged.

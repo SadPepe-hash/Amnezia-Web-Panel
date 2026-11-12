@@ -94,6 +94,10 @@ class FakeAWG:
         self.gate_calls.append(enabled)
         return f'chain gate {enabled}'
 
+    def exit_chain_cut(self, protocol):
+        self.calls.append(('exit_chain_cut', protocol))
+        return 'chain cut'
+
 
 class FakeExit:
     """Exit manager fake: peers (incoming) plus relay uplinks (outgoing)."""
@@ -136,6 +140,23 @@ class FakeExit:
     def relay_write_conf(self, relay, link):
         self.calls.append(('relay_write_conf', relay['iface'], link))
         self.relay_confs[relay['iface']] = dict(link)
+        # the container keeps its own registry so any start.sh re-render can
+        # rebuild the relay blocks (and so chains sharing a host do not clash)
+        if getattr(self, 'ssh', None) is not None:
+            self.ssh.registry[relay['iface']] = '\n'.join([
+                f"R_IF={relay['iface']}",
+                f"R_TABLE={relay['table']}",
+                f"R_PREF={relay.get('rule_pref') or ''}",
+                f"R_SRC={relay['source_ip']}",
+                f"R_MTU={relay.get('mtu', 1420)}",
+            ]) + '\n'
+
+    def relay_teardown(self, relay):
+        self.calls.append(('relay_teardown', relay['iface']))
+        self.relay_confs.pop(relay['iface'], None)
+        if getattr(self, 'ssh', None) is not None:
+            self.ssh.registry.pop(relay['iface'], None)
+        return True
 
     def relay_apply(self, relay, teardown=False):
         self.calls.append(('relay_apply', relay['iface'], teardown))
@@ -146,21 +167,29 @@ class FakeExit:
             raise RuntimeError(self.relay_error)
         return 'relay up'
 
-    def relay_teardown(self, relay):
-        self.calls.append(('relay_teardown', relay['iface']))
-        self.relay_confs.pop(relay['iface'], None)
-        return True
-
-    def relay_write_startup(self, relays):
+    def relay_write_startup(self, relays=None):
+        if relays is None:
+            # the real one reads the container registry; the fake answers with
+            # the params files uploaded so far
+            relays = [{'iface': iface, 'table': 0, 'source_ip': '10.9.0.7'}
+                      for iface in self.ssh.registry]
         self.calls.append(('relay_write_startup',
-                           tuple(relay['iface'] for relay in relays or [])))
-        return [relay['iface'] for relay in relays or []]
+                           tuple(relay['iface'] for relay in relays)))
+        return [relay['iface'] for relay in relays]
 
     def relay_status(self, relay, now=None):
         age = self.relay_handshake
         self.calls.append(('relay_status', relay['iface']))
-        return {'iface': relay['iface'], 'up': age is not None,
-                'handshake_age': age, 'rx_bytes': 5, 'tx_bytes': 6}
+        rule_ok = True
+        route_ok = True
+        if relay.get('rule_pref') is not None and self.ssh.rule_show is not None:
+            rule_ok = any(
+                line.replace(':', ' ').split()[:1] == [str(relay['rule_pref'])]
+                for line in self.ssh.rule_show.splitlines())
+        return {'iface': relay['iface'],
+                'up': age is not None and rule_ok and route_ok,
+                'handshake_age': age, 'rx_bytes': 5, 'tx_bytes': 6,
+                'route_ok': route_ok, 'rule_ok': rule_ok}
 
     def peer_status(self, peer_id, now=None):
         self.calls.append(('peer_status', peer_id))
@@ -173,8 +202,9 @@ class FakeExit:
 class FakeSSH:
     """Answers the RTT probe with a fixed latency so the poll is deterministic.
 
-    `cat /opt/amnezia/start.sh` answers with a canned container start script so
-    the relay startup splice can be exercised end to end."""
+    `cat /opt/amnezia/start.sh` answers with a canned container start script and
+    the relay registry query with the `*.params` files uploaded so far, so the
+    relay startup splice can be exercised end to end."""
 
     START_SCRIPT = ("#!/bin/bash\necho \"Container startup\"\n"
                     "# ---- WARP egress: x_warp_up ----\n"
@@ -186,25 +216,38 @@ class FakeSSH:
         self.commands = []
         self.scripts = []
         self.uploads = {}
+        self.registry = {}          # iface -> params text
+        self.rule_show = None         # canned `ip -4 rule show` output
 
     def run_sudo_command(self, command, timeout=None):
         self.commands.append(command)
         if 'cat /opt/amnezia/start.sh' in command:
             return self.START_SCRIPT, '', 0
+        if 'relay/*.params' in command:
+            body = ''.join(
+                f"### /opt/amnezia/exit/relay/{iface}.params\n{text}"
+                for iface, text in sorted(self.registry.items()))
+            return body, '', 0
+        if 'ip -4 rule show' in command:
+            return self.rule_show, '', 0
         return self.rtt_ms + '\n', '', 0
 
     def run_sudo_script(self, script, timeout=None):
         # the real transport stages the script and runs it as root; host/port
-        # arrive as positional arguments, so the canned answer is the RTT plus
-        # the verification marker
+        # are validated and quoted into the script, so the canned answer is the
+        # RTT plus the verification marker
         self.scripts.append(script)
         return self.rtt_ms + ' both\n', '', 0
 
     def upload_file(self, content, remote_path):
         self.uploads[remote_path] = content
+        if remote_path.endswith('.params'):
+            self.registry[remote_path.rsplit('/', 1)[-1][:-len('.params')]] = content
 
     def run_command(self, command, timeout=60, **kwargs):
         self.commands.append(command)
+        if command.startswith('rm -f ') and 'docker exec' not in command:
+            pass
         return '', '', 0
 
 
@@ -253,8 +296,13 @@ class Harness:
     def exit(self, uid):
         for server in self.data['servers']:
             if server.get('uid') == uid:
-                return self.exits.setdefault(server['host'], FakeExit(server['host'], self.events))
+                host = server['host']
+                return self.exits.setdefault(
+                    host, FakeExit(host, self.events, self.ssh_for(host)))
         raise KeyError(uid)
+
+    def ssh_for(self, host):
+        return self.sshes.setdefault(host, FakeSSH(host, self.rtt_ms))
 
     def record(self, protocol='awg2'):
         return self.data['servers'][0]['protocols'][protocol]
@@ -275,7 +323,9 @@ class ChainBuildTests(unittest.TestCase):
         self.assertIsNone(saved['chain'][0]['relay'])
         self.assertEqual(saved['mode'], 'chain')
         self.assertEqual([c[0] for c in h.awg().calls],
-                         ['exit_prepare_keys', 'exit_link', 'exit_link_status'])
+                         ['exit_prepare_keys', 'exit_link', 'exit_link_status',
+                          'exit_chain_gate'])
+        self.assertEqual(h.awg().gate_calls, [True])
 
     def test_two_hops_register_a_relay_and_its_uplink(self):
         h = Harness()
@@ -504,10 +554,11 @@ class ChainHealthTests(unittest.TestCase):
         h = self.build()
         run(h.service.poll_chain(0, 'awg2'))
         # the RTT of hop 1 is measured ON hop 0 (the previous node of the list);
-        # host and port travel as script arguments, never interpolated
+        # the host is validated and quoted into the script, never interpolated raw
         scripts = h.sshes['203.0.113.5'].scripts
         self.assertTrue(scripts, 'the RTT probe must run on the previous hop')
-        self.assertIn('h="$1"', scripts[0])
+        self.assertIn('h=203.0.113.6;', scripts[0])
+        self.assertIn('p=55520;', scripts[0])
         result = run(h.service.poll_chain(0, 'awg2'))
         self.assertEqual(result['hops'][1]['rtt_ms'], 12.5)
 
@@ -517,7 +568,7 @@ class ChainHealthTests(unittest.TestCase):
         self.assertTrue(res['ok'])
         self.assertEqual(res['rtt_ms'], 12.5)
         self.assertEqual(res['after_uid'], 'exit-0')
-        self.assertIn('h="$1"', h.sshes['203.0.113.5'].scripts[-1])
+        self.assertIn('h=203.0.113.6;', h.sshes['203.0.113.5'].scripts[-1])
 
     def test_chain_probe_of_the_first_hop_comes_from_the_entry(self):
         h = self.build()
@@ -525,7 +576,27 @@ class ChainHealthTests(unittest.TestCase):
         # the first hop is probed from the ENTRY, not from the panel
         self.assertTrue(res['ok'])
         self.assertEqual(res['rtt_ms'], 12.5)
-        self.assertIn('h="$1"', h.sshes['198.51.100.1'].scripts[-1])
+        self.assertIn('h=203.0.113.5;', h.sshes['198.51.100.1'].scripts[-1])
+
+    def test_probe_script_is_valid_bash(self):
+        import shutil
+        import subprocess
+        import tempfile
+        bash = shutil.which('bash')
+        if not bash:
+            self.skipTest('bash not available')
+        h = Harness()
+        run(h.service.chain_probe(0, 'awg2', 'exit-0'))
+        script = h.sshes['198.51.100.1'].scripts[-1]
+        with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False,
+                                         encoding='utf-8') as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            result = subprocess.run([bash, '-n', path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            os.unlink(path)
 
     def test_chain_flags_feed_the_server_list_badge(self):
         h = self.build()
@@ -559,22 +630,51 @@ class ChainHealthTests(unittest.TestCase):
 
     def test_built_chain_registers_the_relay_startup(self):
         h = self.build(('exit-0', 'exit-1', 'exit-2'))
-        calls = [c for c in h.exit('exit-0').calls if c[0] == 'relay_write_startup']
-        calls += [c for c in h.exit('exit-1').calls if c[0] == 'relay_write_startup']
-        self.assertEqual(len(calls), 2, 'every relay host gets its start.sh refreshed')
-        for call in calls:
-            self.assertEqual(len(call[1]), 1)
+        # the startup is rebuilt from the container registry (the union of all
+        # chains that relay here), so both relay hosts are refreshed
+        for uid in ('exit-0', 'exit-1'):
+            calls = [c for c in h.exit(uid).calls if c[0] == 'relay_write_startup']
+            self.assertTrue(calls, f'{uid} start.sh not refreshed')
+        # each relay host keeps its own uplink registered in the container
+        self.assertEqual(sorted(h.sshes['203.0.113.5'].registry),
+                         [h.record()['exit_link']['chain'][0]['relay']['iface']])
+        self.assertEqual(sorted(h.sshes['203.0.113.6'].registry),
+                         [h.record()['exit_link']['chain'][1]['relay']['iface']])
 
-    def test_remove_chain_strips_the_relay_startup(self):
-        h = self.build(('exit-0', 'exit-1', 'exit-2'))
-        h.exit('exit-0').calls.clear()
-        h.exit('exit-1').calls.clear()
+    def test_relay_startup_is_the_union_of_all_chains_on_a_host(self):
+        from managers.exit_manager import ExitManager
+        h = Harness()
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        first_iface = h.record('awg2')['exit_link']['chain'][0]['relay']['iface']
+        run(h.service.build_chain(0, 'awg', ['exit-0', 'exit-1']))
+        second_iface = h.record('awg')['exit_link']['chain'][0]['relay']['iface']
+        # removing one chain must leave the other chain's relay block in start.sh
         run(h.service.remove_chain(0, 'awg2'))
-        stripped = [c for c in h.exit('exit-0').calls if c[0] == 'relay_write_startup']
-        stripped += [c for c in h.exit('exit-1').calls if c[0] == 'relay_write_startup']
-        self.assertEqual(len(stripped), 2)
-        for call in stripped:
-            self.assertEqual(call[1], ())
+        ssh = h.sshes['203.0.113.5']
+        manager = ExitManager.__new__(ExitManager)
+        manager.ssh = ssh
+        ifaces = manager.relay_write_startup()
+        self.assertEqual(ifaces, [second_iface])
+        body = ssh.uploads['/tmp/_amnz_relay_start.sh']
+        self.assertNotIn(first_iface, body)
+        self.assertIn(second_iface, body)
+        self.assertIn('# ---- WARP egress: x_warp_up ----', body)
+
+    def test_remove_chain_tears_everything_down(self):
+        h = self.build(('exit-0', 'exit-1', 'exit-2'))
+        result = run(h.service.remove_chain(0, 'awg2'))
+        self.assertTrue(result['unlinked'])
+        for uid in ('exit-0', 'exit-1', 'exit-2'):
+            self.assertIn('remove_peer', [c[0] for c in h.exit(uid).calls])
+        self.assertIn('relay_teardown', [c[0] for c in h.exit('exit-0').calls])
+        self.assertFalse(h.record().get('exit_link'))
+
+    def test_remove_chain_unlinks_the_entry(self):
+        h = self.build(('exit-0', 'exit-1'))
+        run(h.service.remove_chain(0, 'awg2'))
+        # the entry unlink (which also clears the gate marker) is what lets a
+        # later single link breathe after a restart
+        self.assertIn('exit_unlink', [c[0] for c in h.awg().calls])
 
     def test_relay_write_startup_splices_the_block_and_keeps_warp(self):
         from managers.exit_manager import ExitManager
@@ -771,12 +871,31 @@ class ChainAuditRegressionTests(unittest.TestCase):
         body = ExitManager._relay_shell_functions(manager, relay)
         up = body[body.index('x_relay_up()'):body.index('x_relay_down()')]
         blackhole = up.index('blackhole default metric 0 table $R_TABLE')
-        quick = up.index('$X_QUICK up $R_CONF')
+        rule = up.index('x_rule -4 $R_PREF')
         drop = up.index('-i transit0 -o eth0 -s $R_SRC -j DROP')
+        quick = up.index('$X_QUICK up $R_CONF')
+        remove_drop = up.index('x_ipt_del filter FORWARD -i transit0 -o eth0')
+        verify = up.index('FATAL: relay routing')
         self.assertLess(blackhole, quick, 'blackhole must be in place before the uplink')
+        self.assertLess(rule, quick, 'the policy rule must be in place before the uplink')
         self.assertLess(drop, quick, 'the eth0 guard must be in place before the uplink')
-        self.assertIn('x_ipt_del filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP', up)
-        self.assertIn('^$R_PREF: from $R_SRC lookup $R_TABLE', up)
+        self.assertLess(verify, remove_drop,
+                        'the guard may only be removed after verification')
+        # the guard is INSERTED first: start.sh already ACCEPTs the transit subnet
+        self.assertIn('x_ipt_ins filter FORWARD 1', up)
+        # iproute2 prints "pref:\tfrom ...": any whitespace must match
+        self.assertIn('[[:space:]]+from $R_SRC lookup $R_TABLE', up)
+
+    def test_relay_status_accepts_a_tab_formatted_rule(self):
+        h = self.build()
+        relay = h.record()['exit_link']['chain'][0]['relay']
+        # iproute2 prints "pref:\tfrom <src> lookup <table>" (tab, not space)
+        h.sshes['203.0.113.5'].rule_show = (
+            f"{relay['rule_pref']}:\tfrom {relay['source_ip']} lookup {relay['table']}\n")
+        entry = h.exit('exit-0')
+        status = entry.relay_status(relay)
+        self.assertTrue(status['rule_ok'])
+        self.assertTrue(status['up'])
 
     # --- inferx F5: DNS may not leave the chain ---
     def test_dns_via_exit_cannot_be_disabled_for_a_chain(self):
@@ -875,3 +994,153 @@ class ChainAuditRegressionTests(unittest.TestCase):
         self.assertIn('exit_chain_check_interval_seconds_clamped', result['warnings'])
         self.assertIn('exit_chain_probe_attempts_clamped', result['warnings'])
         self.assertEqual(result['chain']['poll']['check_interval_seconds'], 3600)
+
+
+class ChainAuditRound2Tests(unittest.TestCase):
+    """Regressions for the defects the re-audit found in the first fix round."""
+
+    def build(self, chain=('exit-0', 'exit-1')):
+        h = Harness()
+        run(h.service.build_chain(0, 'awg2', list(chain)))
+        h.awg().calls.clear()
+        h.awg().gate_calls.clear()
+        return h
+
+    # --- inferx N1: the probe script must be valid bash and get its inputs ---
+    def test_probe_script_is_valid_bash_and_quotes_inputs(self):
+        import shutil
+        import subprocess
+        import tempfile
+        bash = shutil.which('bash')
+        if not bash:
+            self.skipTest('bash not available')
+        h = Harness()
+        run(h.service.chain_probe(0, 'awg2', 'exit-0'))
+        script = h.sshes['198.51.100.1'].scripts[-1]
+        with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False,
+                                         encoding='utf-8') as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            result = subprocess.run([bash, '-n', path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            os.unlink(path)
+        self.assertIn('h=203.0.113.5;', script)
+        self.assertIn('p=55520;', script)
+        self.assertIn('1000000', script)          # ns -> ms, not /2000000
+
+    def test_probe_rejects_a_host_with_shell_metacharacters(self):
+        h = self.build()
+        h.data['servers'][2]['host'] = '203.0.113.6; id'   # the probe TARGET
+        res = run(h.service.chain_probe(0, 'awg2', 'exit-1', after_uid='exit-0'))
+        self.assertFalse(res['ok'])
+        self.assertEqual(res['error'], 'invalid_target')
+        self.assertEqual(h.sshes['203.0.113.5'].scripts, [])
+
+    # --- inferx N2: iproute2 prints a tab after the preference ---
+    def test_relay_rule_check_matches_any_whitespace(self):
+        from managers.exit_manager import ExitManager
+        manager = ExitManager.__new__(ExitManager)
+        relay = {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7',
+                 'mtu': 1420, 'rule_pref': 3123}
+        body = ExitManager._relay_shell_functions(manager, relay)
+        self.assertIn('[[:space:]]+from $R_SRC lookup $R_TABLE', body)
+        self.assertNotIn('grep -q "^$R_PREF: from', body)
+
+    # --- inferx N3: rule+blackhole before awg-quick, guard removed after proof ---
+    def test_relay_rule_and_blackhole_come_before_the_uplink(self):
+        from managers.exit_manager import ExitManager
+        manager = ExitManager.__new__(ExitManager)
+        relay = {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7',
+                 'mtu': 1420, 'rule_pref': 3123}
+        up = ExitManager._relay_shell_functions(manager, relay)
+        up = up[up.index('x_relay_up()'):up.index('x_relay_down()')]
+        self.assertLess(up.index('x_rule -4 $R_PREF'), up.index('$X_QUICK up $R_CONF'))
+        self.assertLess(up.index('blackhole default metric 0'), up.index('$X_QUICK up $R_CONF'))
+        self.assertLess(up.index('FATAL: relay routing'), up.index('x_ipt_del filter FORWARD -i transit0 -o eth0'))
+
+    # --- inferx N4/N5: the rebuild cuts the entry before anything is torn down ---
+    def test_rebuild_cuts_the_entry_before_the_teardown(self):
+        h = self.build(('exit-0', 'exit-1'))
+        h.awg().calls.clear()
+        result = run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        self.assertEqual(result['status'], 'success')
+        kinds = [c[0] for c in h.awg().calls]
+        # the egress is cut first and the kill-switch is kept: exit_unlink would
+        # drop the rules and let clients leave via eth0 for the whole rebuild
+        self.assertEqual(kinds[0], 'exit_chain_cut')
+        self.assertNotIn('exit_unlink', kinds)
+        # ...and the egress is reopened only after the new chain is up
+        self.assertEqual(kinds[-1], 'exit_chain_gate')
+        self.assertEqual(h.awg().gate_calls[-1], True)
+
+    def test_rebuild_of_a_shorter_chain_keeps_relay_wiring_stable(self):
+        h = self.build(('exit-0', 'exit-1', 'exit-2'))
+        relay_a = h.record()['exit_link']['chain'][0]['relay']
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        relay_b = h.record()['exit_link']['chain'][0]['relay']
+        # no drift: the old chain is dropped from the plan, so the same
+        # (prefix, index) maps to the same table/pref/iface
+        self.assertEqual(relay_a['table'], relay_b['table'])
+        self.assertEqual(relay_a['rule_pref'], relay_b['rule_pref'])
+        self.assertEqual(relay_a['iface'], relay_b['iface'])
+        torn = [c[1] for c in h.exit('exit-1').calls if c[0] == 'relay_teardown']
+        self.assertTrue(torn, 'the dropped hop must be torn down')
+
+    # --- inferx N6: the marker must not outlive the chain ---
+    def test_remove_chain_unlinks_the_entry_and_clears_the_marker(self):
+        h = self.build(('exit-0', 'exit-1'))
+        h.exit('exit-1').peer_missing.add('exit-0:chain1')
+        run(h.service.poll_chain(0, 'awg2'))          # broken: marker is set
+        run(h.service.remove_chain(0, 'awg2'))
+        # exit_unlink is the only path that clears the marker in the container
+        self.assertIn('exit_unlink', [c[0] for c in h.awg().calls])
+
+    # --- inferx N8: link() may not overwrite a chain, even at its first hop ---
+    def test_link_cannot_overwrite_a_chain_at_its_first_hop(self):
+        h = self.build()
+        first_uid = h.record()['exit_link']['chain'][0]['uid']
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.link(0, 'awg2', first_uid))
+        self.assertEqual(ctx.exception.code, 'chain_present_use_chain_api')
+        # the chain record is untouched
+        self.assertEqual(len(h.record()['exit_link']['chain']), 2)
+
+    # --- inferx N9/N14: unlink() delegates chain removal to remove_chain ---
+    def test_unlink_of_a_chain_restores_failover_and_mtu(self):
+        h = Harness()
+        run(h.service.link(0, 'awg2', 'exit-0'))
+        run(h.service.configure_failover(0, 'awg2', enabled=True, backup_uids=['exit-1']))
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        self.assertFalse(h.record()['exit_failover']['enabled'])
+        result = run(h.service.unlink(0, 'awg2'))
+        self.assertTrue(result['unlinked'])
+        self.assertFalse(h.record().get('exit_link'))
+        self.assertTrue(h.record()['exit_failover']['enabled'])
+        # the relay startup of the host is rebuilt (union), not stripped blind
+        self.assertTrue([c for c in h.exit('exit-0').calls
+                         if c[0] == 'relay_write_startup'])
+
+    # --- inferx N11: a legacy record without rule_pref is normalised on read ---
+    def test_legacy_relay_record_gets_a_rule_pref_on_read(self):
+        h = self.build(('exit-0', 'exit-1'))
+        relay = h.record()['exit_link']['chain'][0]['relay']
+        relay.pop('rule_pref', None)
+        data = h.data
+        _record, chain = h.service._chain_record(data, h.record())
+        self.assertTrue(chain[0]['relay'].get('rule_pref'))
+        result = run(h.service.poll_chain(0, 'awg2'))
+        self.assertNotEqual(result['action'], 'gate_off')
+
+    # --- inferx N10: no table/pref drift across repeated repairs ---
+    def test_repair_twice_keeps_the_same_relay_wiring(self):
+        h = self.build(('exit-0', 'exit-1'))
+        first = h.record()['exit_link']['chain'][0]['relay']
+        run(h.service.repair_chain(0, 'awg2'))
+        second = h.record()['exit_link']['chain'][0]['relay']
+        run(h.service.repair_chain(0, 'awg2'))
+        third = h.record()['exit_link']['chain'][0]['relay']
+        self.assertEqual(first['table'], second['table'])
+        self.assertEqual(second['table'], third['table'])
+        self.assertEqual(first['rule_pref'], third['rule_pref'])
