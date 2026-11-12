@@ -5753,7 +5753,10 @@
     }
 
     async function saveExitLink(force = false) {
-        if (currentExitChain && currentExitChain.length > 1) {
+        // a record that came from the chain API stays on the chain API, even
+        // when the operator trimmed it down to one hop
+        if ((currentExitChainView && currentExitChainView.mode === 'chain')
+            || (currentExitChain && currentExitChain.length > 1)) {
             return saveExitChain(false);
         }
         const uid = document.getElementById('exitLinkSelect').value;
@@ -5763,6 +5766,9 @@
     }
 
     async function removeExitLink() {
+        if (currentExitChainView && currentExitChainView.mode === 'chain') {
+            return removeExitChain();
+        }
         if (currentExitChain && currentExitChain.length > 1) {
             return removeExitChain();
         }

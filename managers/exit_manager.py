@@ -556,6 +556,10 @@ fi
         if pref is not None and (not isinstance(pref, int) or isinstance(pref, bool)
                                  or not (3000 <= pref < 4000)):
             raise ValueError(f'invalid relay rule preference: {pref!r}')
+        prefix = relay.get('prefix')
+        if prefix is not None and (not isinstance(prefix, str)
+                                   or not re.match(r'^[0-9a-f]{4}$', prefix)):
+            raise ValueError(f'invalid relay chain prefix: {prefix!r}')
 
     @staticmethod
     def relay_conf_path(relay):
@@ -616,7 +620,7 @@ fi
             f"R_SRC={relay['source_ip']}\n"          # /32 of the previous hop on transit0
             f"R_MTU={relay.get('mtu', 1420)}\n"
             "X_QUICK=awg-quick\n"                     # same binary inside the exit container
-            "x_ipt_ins() { iptables -t \"$1\" -C \"${@:2}\" 2>/dev/null || iptables -t \"$1\" -I \"${@:2}\"; }\n"
+            "x_ipt_ins() { table=\"$1\"; chain=\"$2\"; pos=\"$3\"; shift 3; iptables -t \"$table\" -C \"$chain\" \"$@\" 2>/dev/null || iptables -t \"$table\" -I \"$chain\" \"$pos\" \"$@\"; }\n"
             f"{_IP_RULE_HELPERS}"
             "x_relay_up() {\n"
             # Fail-closed BEFORE the uplink exists: the policy rule and the
@@ -740,7 +744,8 @@ fi
         return out
 
     def relay_teardown(self, relay):
-        """Take the uplink down and drop its files so start.sh stays inert."""
+        """Take the uplink down and drop every file it owns (conf, params and
+        the private key: a removed chain must not leave key material behind)."""
         self._validate_relay(relay)
         iface = relay['iface']
         try:
@@ -748,7 +753,8 @@ fi
         finally:
             self.ssh.run_sudo_command(
                 f"docker exec -i {self.CONTAINER_NAME} rm -f "
-                f"/opt/amnezia/exit/relay/{iface}.conf /opt/amnezia/exit/relay/{iface}.params")
+                f"/opt/amnezia/exit/relay/{iface}.conf /opt/amnezia/exit/relay/{iface}.params "
+                f"/opt/amnezia/exit/relay/{iface}_private.key")
         return True
 
     def relay_status(self, relay, now=None):
@@ -850,14 +856,19 @@ fi
         """Splice the relay blocks into start.sh so every uplink of this
         container comes back after a restart.
 
-        Without an explicit list the container's own registry is used - the
-        union of every chain that relays here. The block is spliced between
-        markers (never re-rendered), so a WARP egress block or any other local
-        content survives."""
-        if relays is None:
-            relays = self.relay_read_registry()
+        The block set is the UNION of the container registry (what the container
+        knows about) and the relays the panel passes explicitly - a chain built
+        before the registry existed therefore still gets its block, and chains
+        that share this host never lose each other's wiring. The block is
+        spliced between markers (never re-rendered), so a WARP egress block or
+        any other local content survives."""
+        known = {relay['iface']: dict(relay) for relay in self.relay_read_registry()}
+        for relay in relays or []:
+            self._validate_relay(relay)
+            known.setdefault(relay['iface'], dict(relay))
+        merged = list(known.values())
         blocks = []
-        for relay in relays:
+        for relay in merged:
             iface = relay['iface']
             conf = f'/opt/amnezia/exit/relay/{iface}.conf'
             blocks.append(
@@ -889,7 +900,7 @@ fi
                     raise RuntimeError(f'Failed to write start.sh: {err or out}')
         finally:
             self.ssh.run_command('rm -f /tmp/_amnz_relay_start.sh')
-        return [relay['iface'] for relay in relays]
+        return [relay['iface'] for relay in merged]
 
     def _write_start_script(self, protocol_type=None, config_path=None,
                             warp_ctx=None):

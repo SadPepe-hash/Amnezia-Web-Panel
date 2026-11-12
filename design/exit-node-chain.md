@@ -229,3 +229,52 @@ fixed in the second round, again with one regression test each:
     ifaces and `_relay_plan` regenerates the chain prefix on collision.
 12. **ping-only probes claimed success** (inferx N15): a hop whose transit port
     never answered now reads as not reachable.
+
+## Third audit round (both agents again)
+
+The re-audit found that the second round had again broken the feature; all of
+it is fixed in the third round, again with one regression test each:
+
+1. **The gate verification was unsatisfiable** (inferx N1): `x_killswitch_on`
+   leaves a metric-1000 placeholder while the gate installs a metric-0
+   blackhole, so the "exactly one default" check always saw two and every
+   `x_chain_gate` returned 3; and `x_rule_has` compared the host address
+   (`from 10.8.1.1/24`) while iproute2 prints the normalised network
+   (`from 10.8.1.0/24`). Now: the placeholder is deleted first and the rule is
+   matched by `pref:\s*from <network> lookup <table>`.
+2. **A failed rebuild re-opened direct egress** (inferx N2, critical): the
+   rollback called `exit_unlink`, which drops the kill-switch and the marker,
+   and the dropped record was never restored - i.e. repairing a chain while a
+   hop is down deanonymised the clients. Now: a rebuild failure keeps the cut,
+   restores the previous chain record and restores the MTU.
+3. **A vanished hop server made a chain unremovable** (inferx N3): `_teardown_chain`
+   raised `exit_not_found`. Now it skips the missing hop, and `remove_chain`
+   always drops the record (`try/finally`).
+4. **A relay leaked around `x_relay_up`** (inferx N5): the peer that feeds
+   transit0 is created before the guard exists, and the guard block sits at the
+   end of start.sh, after the base ACCEPT/MASQUERADE of the exit container. The
+   relay wiring is now installed by the panel before the first peer is added and
+   the startup block is spliced from the container registry, so a restart
+   re-applies it; the base egress window is documented as the residual risk.
+5. **Legacy chains were read as broken** (inferx N4 + nemotron N1): a record
+   without `rule_pref` got a fabricated `crc32` preference that does not match
+   the kernel's rule, and the container registry was empty for chains built by
+   the first commit. Now: legacy records read back the preference that version
+   actually installed (3000), and `_refresh_relay_startup` passes the panel's
+   own relays explicitly, so their startup block is written even without a
+   registry.
+6. **`link()`, `unlink()` and 1-hop saves** (inferx N6/N7, N8/N9): a single link
+   converted into a chain now removes the peer on the old exit; any chain-mode
+   record (even one trimmed to a single hop) is routed through the chain API by
+   the UI.
+7. **Wiring churn** (inferx N9/N12): an interface collision now bumps the hop
+   index instead of picking a random chain prefix, and both MTU directions are
+   handled, so shortening a chain raises the client MTU back.
+8. **`x_ipt_ins` was never idempotent** (inferx N10): it passed the position to
+   `-C`, which does not accept one, so the guard was re-inserted on every apply.
+   Now the check runs without the position and the insert with it.
+9. **Poll details** (inferx N8/N11, nemotron N3/N9): the probe verdict is
+   recorded per hop, `teardown_pending` survives the poll and is shown on the
+   badge, the per-hop probes run in parallel, the gate is retried once inside
+   the same pass, `x_chain_cut` verifies like the gate, and a relay teardown
+   also deletes the uplink private key.

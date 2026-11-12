@@ -2880,7 +2880,7 @@ fi
             extra_blocks=('# ---- Exit-node link: bring it up now that the client tunnel exists ----\n'
                           'if [ -f "$EXIT_CONF" ]; then x_link_up || echo "! exit link not applied, clients stay on the kill-switch"; fi\n'
                           '# A chain that was broken before the restart must stay cut\n'
-                          'if [ -f "$CHAIN_GATE_MARKER" ]; then x_chain_gate off || echo "! chain gate not re-applied after restart"; fi\n'
+                          'if [ -f "$CHAIN_GATE_MARKER" ] && [ -f "$EXIT_CONF" ]; then x_chain_gate off || echo "! chain gate not re-applied after restart"; fi\n'
                           + warp_extra,),
         )
 
@@ -2983,7 +2983,7 @@ x_exit_sync() {
   else x_link_down; x_killswitch_off; fi
 }
 x_route_defaults() { ip -4 route show table $1 2>/dev/null | grep -c "^default\|^blackhole"; }
-x_rule_has() { ip -4 rule show 2>/dev/null | grep -Eq "^$1:[[:space:]]+from $2 lookup $3"; }
+x_rule_has() { ip -4 rule show 2>/dev/null | grep -Eq "^$1:[[:space:]]+from [0-9./]+ lookup $3"; }
 x_chain_gate() {
   # Fail-closed gate of the entry egress, driven by the health of the whole
   # chain (not just this link): "off" leaves exactly ONE default route in the
@@ -2994,6 +2994,10 @@ x_chain_gate() {
     # without the policy rule nothing reaches the table: the gate would be a
     # decoration, so the kill-switch rule is (re)installed first
     x_killswitch_on
+    # x_killswitch_on leaves a metric-1000 placeholder: it must go, otherwise
+    # the table would hold two default routes and the check below could never
+    # pass
+    ip -4 route del default metric 1000 table $EXIT_TABLE 2>/dev/null
     ip -4 route del default dev $EXIT_IF table $EXIT_TABLE 2>/dev/null
     ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
     ip -4 route replace blackhole default metric 0 table $EXIT_TABLE
@@ -3001,6 +3005,7 @@ x_chain_gate() {
   else
     ip -4 route del blackhole default table $EXIT_TABLE 2>/dev/null
     ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
+    ip -4 route del default metric 1000 table $EXIT_TABLE 2>/dev/null
     ip -4 route replace default dev $EXIT_IF table $EXIT_TABLE
     rm -f "$CHAIN_GATE_MARKER"
   fi
@@ -3023,8 +3028,14 @@ x_chain_cut() {
   # the whole rebuild - exactly what fail-closed must not allow.
   x_link_down
   x_killswitch_on
+  ip -4 route del default metric 1000 table $EXIT_TABLE 2>/dev/null
   ip -4 route replace blackhole default metric 0 table $EXIT_TABLE
   touch "$CHAIN_GATE_MARKER"
+  if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $X_SUBNET >/dev/null 2>&1; fi
+  # same standard as the gate: never report a cut that is not in place
+  x_rule_has $EXIT_PREF $X_SUBNET $EXIT_TABLE || { echo "! FATAL: policy rule is not in place"; return 3; }
+  [ "$(x_route_defaults $EXIT_TABLE)" = "1" ] || { echo "! FATAL: the table must hold exactly one default route"; return 3; }
+  ip -4 route show table $EXIT_TABLE | grep -q "^blackhole default" || { echo "! FATAL: chain cut is not in place"; return 3; }
   echo "chain cut: egress closed for the rebuild"
 }
 """

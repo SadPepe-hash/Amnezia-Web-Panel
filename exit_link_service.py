@@ -11,6 +11,7 @@ tested with fake managers and an in-memory data.json.
 """
 
 import asyncio
+import copy
 import logging
 import re
 import shlex
@@ -1113,6 +1114,9 @@ class ExitLinkService:
 
     # ----- exit-node chain (multi-hop egress) -----
 
+    # Preference the first chain commit (0d2c509) hard-wired into x_relay_up.
+    LEGACY_RELAY_PREF = 3000
+
     # Fields the browser may see of a stored link; PSKs stay server-side.
     PUBLIC_LINK_FIELDS = ('exit_uid', 'exit_name', 'transit_ip', 'endpoint_host',
                           'endpoint_port', 'obfuscation', 'dns_via_exit', 'stale',
@@ -1174,18 +1178,17 @@ class ExitLinkService:
         from managers.exit_manager import ExitManager
         taken_tables, taken_prefs, taken_ifaces = self._tables_in_use(
             data, hop_srv.get('uid'))
-        iface = ExitManager.relay_iface_for(prefix, index)
-        if iface in taken_ifaces:
-            # a 16-bit prefix can collide: another prefix keeps both interfaces
-            for _attempt in range(8):
-                prefix = uuid.uuid4().hex[:4]
-                iface = ExitManager.relay_iface_for(prefix, index)
-                if iface not in taken_ifaces:
-                    break
+        bump = 0
+        while ExitManager.relay_iface_for(prefix, index + bump) in taken_ifaces:
+            bump += 1
+            if bump > 8:
+                raise ExitLinkError('chain_iface_exhausted',
+                                    'No free relay interface on this host; remove another chain first')
+        hop_index = index + bump
         return {
-            'iface': iface,
-            'table': ExitManager.relay_table_for(prefix, index, taken_tables),
-            'rule_pref': ExitManager.relay_pref_for(prefix, index, taken_prefs),
+            'iface': ExitManager.relay_iface_for(prefix, hop_index),
+            'table': ExitManager.relay_table_for(prefix, hop_index, taken_tables),
+            'rule_pref': ExitManager.relay_pref_for(prefix, hop_index, taken_prefs),
             'source_ip': source_ip,
             'mtu': EXIT_MTU_LIMIT,
             'prefix': prefix,
@@ -1248,7 +1251,14 @@ class ExitLinkService:
         # 2) relay uplinks, newest hop first
         for index in range(len(chain) - 1, -1, -1):
             hop = chain[index]
-            hop_srv, _ = self._exit(data, hop.get('uid'))
+            try:
+                hop_srv, _ = self._exit(data, hop.get('uid'))
+            except ExitLinkError as err:
+                # the hop server was deleted: nothing remote to tear down, but
+                # the removal must still finish (an unremovable chain would
+                # make clients oscillate between direct egress and the cut)
+                logger.warning("chain hop %s is gone: %s", hop.get('uid'), err)
+                continue
             exit_manager = await self._exit_manager(hop_srv)
             peers.append((exit_manager,
                           peer_id_for(entry['uid'], protocol) if index == 0
@@ -1383,34 +1393,51 @@ class ExitLinkService:
                 'to an exit node')
         target_mtu = chain_policy.client_mtu_for_chain(hops_count)
         warnings = []
-        mtu_lowered = False
-        if hops_count > 1 and mtu and mtu > target_mtu:
-            if not mtu_override:
+        mtu_adjusted = False
+        if mtu and mtu != target_mtu:
+            if mtu > target_mtu and not mtu_override:
                 raise ExitLinkError(
                     'chain_mtu_override_required',
                     f'Client MTU {mtu} cannot survive {hops_count} hops; '
                     f'it must be lowered to {target_mtu}. Apply the new MTU?')
+            if mtu > target_mtu:
+                warnings.append('exit_chain_mtu_lowered')
+            else:
+                warnings.append('exit_chain_mtu_raised')
             try:
                 await asyncio.to_thread(awg.update_awg_settings, protocol, mtu=target_mtu)
+                mtu_adjusted = True
             except Exception as err:
                 raise ExitLinkError('exit_apply_failed',
-                                    f'Could not lower the client MTU: {err}')
-            mtu_lowered = True
-            warnings.append('exit_chain_mtu_lowered')
+                                    f'Could not apply the chain MTU {target_mtu}: {err}')
 
         # A previous chain is never left half-alive: interfaces, rules,
         # peers and start.sh blocks of hops that are gone come down first.
         # The egress is CUT (kill-switch kept) instead of unlinked, so clients
         # cannot leave via the entry's eth0 during the rebuild.
         if previous.get('chain'):
-            # the teardown cuts the egress (kill-switch kept) and drops the
-            # record, so clients cannot leave via the entry's eth0 during the
-            # rebuild and relay planning starts from a fresh snapshot
+            previous_record = copy.deepcopy(previous)
             await self._teardown_chain(entry, protocol, entry_action='cut',
                                        drop_record=True)
             data = self.load_data()
             entry, rec = self._entry_by_uid(data, entry['uid'], protocol)
             previous = rec.get('exit_link') or {}
+        elif previous.get('exit_uid'):
+            # a plain single link is being replaced by a chain: the old exit
+            # keeps no orphan peer for a link the panel no longer knows
+            previous_record = copy.deepcopy(previous)
+            try:
+                awg = await self._awg(entry)
+                await asyncio.to_thread(awg.exit_unlink, protocol)
+                old_srv, _ = self._exit(data, previous['exit_uid'])
+                old_manager = await self._exit_manager(old_srv)
+                await asyncio.to_thread(old_manager.remove_peer, None,
+                                        peer_id_for(entry['uid'], protocol))
+            except Exception as err:
+                logger.warning("could not clean the previous single link before the chain: %s", err)
+                warnings.append('exit_old_link_cleanup_failed')
+        else:
+            previous_record = {}
         built, hop_records = [], []
         prev_uplink_pub = None
         try:
@@ -1511,9 +1538,27 @@ class ExitLinkService:
                     hop_records[-1]['relay'] = relay
                     prev_uplink_pub = uplink_pub
         except Exception:
-            await self._rollback_chain(built)
-            if mtu_lowered and mtu:
-                # the lowered MTU is part of the failed attempt: undo it
+            # Rollback of a REBUILD must never unlink the entry: that would drop
+            # the kill-switch and send clients out via the entry's eth0 while the
+            # chain is down - the anonymity break the cut was introduced for. The
+            # cut stays, the previous chain is restored so the operator keeps his
+            # configuration, and the adjusted MTU goes back.
+            if previous_record.get('chain'):
+                try:
+                    awg = await self._awg(entry)
+                    await asyncio.to_thread(awg.exit_chain_cut, protocol)
+                except Exception as err:
+                    logger.warning("could not keep the egress cut after a failed rebuild: %s", err)
+                try:
+                    await self._update_record(
+                        entry['uid'], protocol,
+                        lambda r: r.update({'exit_link': previous_record}))
+                except Exception as err:
+                    logger.warning("could not restore the previous chain after a failed rebuild: %s", err)
+            else:
+                await self._rollback_chain(built)
+            if mtu_adjusted and mtu:
+                # the adjusted MTU is part of the failed attempt: undo it
                 awg = await self._awg(entry)
                 await self._restore_mtu(awg, protocol, mtu)
             raise
@@ -1539,7 +1584,7 @@ class ExitLinkService:
             await self._record_chain(entry, first_srv, protocol, record, source)
         except Exception:
             await self._rollback_chain(built)
-            if mtu_lowered and mtu:
+            if mtu_adjusted and mtu:
                 await self._restore_mtu(awg, protocol, mtu)
             raise
         await self._refresh_relay_startup(self._relay_hosts(hop_records))
@@ -1562,22 +1607,22 @@ class ExitLinkService:
     async def _refresh_relay_startup(self, relays_by_host=None):
         """Make every relay hop come back after a container/host restart.
 
-        With no explicit mapping the container's own registry is used, which is
-        the union of every chain that relays there - so removing or repairing
-        one chain never deletes another chain's startup block."""
+        Panel-known relays are passed explicitly, so a chain built before the
+        container registry existed still gets its block; the container registry
+        adds the rest (the union of every chain that relays there), so removing
+        or repairing one chain never deletes another chain's startup block."""
         data = self.load_data()
         if relays_by_host is None:
-            hosts = {}
+            relays_by_host = {}
             for hop in self._all_chain_relays(data):
-                hosts.setdefault(hop['host_uid'], hop)
-            relays_by_host = {uid: None for uid in hosts}
-        for uid in (relays_by_host or {}):
+                relays_by_host.setdefault(hop['host_uid'], []).append(hop['relay'])
+        for uid, relays in (relays_by_host or {}).items():
             _, srv = self.find_server_by_uid(data, uid)
             if not srv:
                 continue
             try:
                 manager = await self._exit_manager(srv)
-                await asyncio.to_thread(manager.relay_write_startup)
+                await asyncio.to_thread(manager.relay_write_startup, relays or [])
             except Exception as err:
                 logger.warning("could not refresh the relay startup of %s: %s",
                                srv.get('name'), err)
@@ -1628,9 +1673,14 @@ class ExitLinkService:
                     lambda r: (r.get('exit_link') or {}).__setitem__('stale', 'teardown_pending'))
                 raise ExitLinkError('exit_unlink_failed',
                                     f'Entry link could not be removed: {err}')
-            await self._teardown_chain(entry, protocol)
-            failover_restored = await self._restore_failover_after_chain(entry['uid'], protocol)
-            await self._update_record(entry['uid'], protocol, self._drop_link_keep_failover)
+            try:
+                # relays and peers: a vanished hop server is tolerated inside
+                await self._teardown_chain(entry, protocol)
+            finally:
+                # the record always goes: a chain that cannot be removed would
+                # make clients oscillate between direct egress and the cut
+                failover_restored = await self._restore_failover_after_chain(entry['uid'], protocol)
+                await self._update_record(entry['uid'], protocol, self._drop_link_keep_failover)
             if failover_restored:
                 # _drop_link_keep_failover disables the poll: bring back the
                 # setting the chain had disabled
@@ -1804,13 +1854,16 @@ class ExitLinkService:
         chain = record.get('chain')
         if isinstance(chain, list) and chain:
             # a stored chain: fill in the rule preference older records lack,
-            # so relay_status does not read a legacy hop as permanently broken
+            # so relay_status does not read a legacy hop as permanently broken.
+            # 0d2c509 hard-wired preference 3000 and stored no chain_prefix;
+            # later versions derive it per (prefix, hop).
             from managers.exit_manager import ExitManager
             for index, hop in enumerate(chain):
                 relay = hop.get('relay') if isinstance(hop, dict) else None
                 if isinstance(relay, dict) and not relay.get('rule_pref'):
-                    relay['rule_pref'] = ExitManager.relay_pref_for(
-                        record.get('chain_prefix') or '', index + 1)
+                    relay['rule_pref'] = (
+                        self.LEGACY_RELAY_PREF if not record.get('chain_prefix')
+                        else ExitManager.relay_pref_for(record['chain_prefix'], index + 1))
             return record, chain
         if record.get('exit_uid'):
             chain = record.get('chain') or []
@@ -1833,17 +1886,7 @@ class ExitLinkService:
             normalised['mode'] = 'single'
             normalised['chain'] = [hop]
             return normalised, [hop]
-        # a stored chain: fill in the rule preference older records lack, so
-        # relay_status does not read a legacy hop as permanently broken
-        chain = record.get('chain') or []
-        if chain:
-            from managers.exit_manager import ExitManager
-            for index, hop in enumerate(chain):
-                relay = hop.get('relay') if isinstance(hop, dict) else None
-                if isinstance(relay, dict) and not relay.get('rule_pref'):
-                    relay['rule_pref'] = ExitManager.relay_pref_for(
-                        record.get('chain_prefix') or '', index + 1)
-        return record, chain
+        return record, chain or []
 
     def chain_view(self, data, rec, entry_uid):
         """JSON-safe chain + poll state for the API/UI (no SSH)."""
@@ -1974,18 +2017,27 @@ class ExitLinkService:
             hops_result.append(item)
 
         # latency of every hop as seen from the previous node of the list
-        for index, item in enumerate(hops_result):
-            after = entry if index == 0 else None
+        # (in parallel: 8 SSH probes must not eat the poll interval)
+        async def probe_hop(index):
+            item = hops_result[index]
             try:
+                after = entry if index == 0 else None
                 _, hop_srv = self.find_server_by_uid(data, item['uid'])
                 if index > 0:
                     _, after = self.find_server_by_uid(data, chain[index - 1].get('uid'))
                 hop_rec = ((hop_srv.get('protocols') or {}).get('exit') or {})
-                ok, rtt_ms, _err = await self._probe_rtt(
+                ok, rtt_ms, err = await self._probe_rtt(
                     after, hop_srv, hop_rec.get('port'), entry_srv=entry)
                 item['rtt_ms'] = rtt_ms
+                # informational: the hop verdict stays with handshakes and
+                # routing, but a probe failure is recorded for the operator
+                item['probe_ok'] = bool(ok)
+                if not ok:
+                    item['probe_error'] = err
             except Exception as err:
                 logger.warning("chain rtt probe %s failed: %s", item.get('uid'), err)
+
+        await asyncio.gather(*(probe_hop(index) for index in range(len(hops_result))))
 
         decision = chain_policy.decide(cfg, state, now, hops_result)
         state = decision['state']
@@ -1996,21 +2048,25 @@ class ExitLinkService:
             hop.get('ok') for hop in hops_result)
 
         gate_applied = None
-        try:
-            if broken_now:
-                # every poll while broken: a restart must not reopen the gate
-                await asyncio.to_thread(awg.exit_chain_gate, protocol, False)
-                gate_applied = False
-            elif action == chain_policy.ACTION_GATE_ON:
-                await asyncio.to_thread(awg.exit_chain_gate, protocol, True)
-                gate_applied = True
-        except Exception as err:
-            logger.warning("chain gate %s failed for %s/%s: %s",
-                           'off' if broken_now else 'on', entry_uid, protocol, err)
-            gate_applied = None
-            if broken_now:
-                # fail-closed could not be applied: say so, retry next poll
-                state['last_reason'] = 'gate_apply_failed'
+        for attempt in (1, 2):
+            try:
+                if broken_now:
+                    # every poll while broken: a restart must not reopen the gate
+                    await asyncio.to_thread(awg.exit_chain_gate, protocol, False)
+                    gate_applied = False
+                elif action == chain_policy.ACTION_GATE_ON:
+                    await asyncio.to_thread(awg.exit_chain_gate, protocol, True)
+                    gate_applied = True
+                break
+            except Exception as err:
+                logger.warning("chain gate %s failed for %s/%s (attempt %s): %s",
+                               'off' if broken_now else 'on', entry_uid, protocol, attempt, err)
+                if attempt == 2:
+                    gate_applied = None
+                    if broken_now:
+                        # fail-closed could not be applied: say so and keep the
+                        # marker, so the next poll and every restart retry it
+                        state['last_reason'] = 'gate_apply_failed'
         if gate_applied is False:
             state['gate'] = 'off'
         elif gate_applied is True:
@@ -2030,7 +2086,11 @@ class ExitLinkService:
         def mutate(r):
             link = r.get('exit_link')
             if isinstance(link, dict):
-                link['stale'] = stale
+                # a removal that could not finish must survive every poll
+                if link.get('stale') == 'teardown_pending':
+                    pass
+                else:
+                    link['stale'] = stale
             payload = chain_policy.normalize_config(r.get('exit_chain_poll'))
             payload.update({
                 'enabled': cfg.get('enabled', payload['enabled']),
@@ -2117,7 +2177,8 @@ class ExitLinkService:
                 stale = str(link.get('stale') or '')
                 if not stale:
                     continue
-                if not stale.startswith('chain_broken_hop_') and stale != 'chain_gate_apply_failed':
+                if not stale.startswith('chain_broken_hop_') \
+                        and stale not in ('chain_gate_apply_failed', 'teardown_pending'):
                     continue
                 broken = {
                     'protocol': proto,

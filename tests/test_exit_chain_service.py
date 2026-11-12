@@ -322,9 +322,11 @@ class ChainBuildTests(unittest.TestCase):
         self.assertEqual(saved['chain'][0]['uid'], 'exit-0')
         self.assertIsNone(saved['chain'][0]['relay'])
         self.assertEqual(saved['mode'], 'chain')
+        # the client MTU is restored to the single-hop budget first
         self.assertEqual([c[0] for c in h.awg().calls],
-                         ['exit_prepare_keys', 'exit_link', 'exit_link_status',
-                          'exit_chain_gate'])
+                         ['update_awg_settings', 'exit_prepare_keys', 'exit_link',
+                          'exit_link_status', 'exit_chain_gate'])
+        self.assertEqual(h.awg().applied_mtu, 1420)
         self.assertEqual(h.awg().gate_calls, [True])
 
     def test_two_hops_register_a_relay_and_its_uplink(self):
@@ -834,7 +836,9 @@ class ChainAuditRegressionTests(unittest.TestCase):
     def test_start_script_reapplies_a_closed_gate_after_restart(self):
         from managers.awg_manager import AWGManager
         body = AWGManager(None)._render_start_script('awg2')
-        self.assertIn('[ -f "$CHAIN_GATE_MARKER" ]; then x_chain_gate off', body)
+        # the marker only means anything while a link exists: an orphaned marker
+        # must not blackhole a healthy single link after a restart
+        self.assertIn('if [ -f "$CHAIN_GATE_MARKER" ] && [ -f "$EXIT_CONF" ]; then x_chain_gate off', body)
         self.assertTrue(AWGManager._EXIT_SHELL_TEMPLATE.count('CHAIN_GATE_MARKER') >= 2)
 
     # --- inferx F2/F7: two chains on one relay host keep their own rules ---
@@ -1144,3 +1148,161 @@ class ChainAuditRound2Tests(unittest.TestCase):
         self.assertEqual(first['table'], second['table'])
         self.assertEqual(second['table'], third['table'])
         self.assertEqual(first['rule_pref'], third['rule_pref'])
+
+
+class ChainAuditRound3Tests(unittest.TestCase):
+    """Regressions for the third audit round."""
+
+    def build(self, chain=('exit-0', 'exit-1')):
+        h = Harness()
+        run(h.service.build_chain(0, 'awg2', list(chain)))
+        h.awg().calls.clear()
+        h.awg().gate_calls.clear()
+        return h
+
+    def test_gate_off_verification_is_satisfiable(self):
+        from managers.awg_manager import AWGManager
+        template = AWGManager._EXIT_SHELL_TEMPLATE
+        off = template[:template.index('x_chain_cut()')]
+        # the metric-1000 placeholder of x_killswitch_on must go before the
+        # "exactly one default" check can ever pass
+        self.assertIn('ip -4 route del default metric 1000 table $EXIT_TABLE', off)
+        # iproute2 normalises "from 10.8.1.1/24" to "from 10.8.1.0/24": the rule
+        # check must not compare the host address literally
+        self.assertIn('from [0-9./]+ lookup $3', template)
+
+    def test_cut_is_verified_like_the_gate(self):
+        from managers.awg_manager import AWGManager
+        cut = AWGManager._EXIT_SHELL_TEMPLATE[
+            AWGManager._EXIT_SHELL_TEMPLATE.index('x_chain_cut()'):]
+        self.assertIn('x_rule_has $EXIT_PREF $X_SUBNET $EXIT_TABLE', cut)
+        self.assertIn('FATAL: chain cut is not in place', cut)
+
+    def test_start_sh_gate_reapply_requires_a_live_link(self):
+        from managers.awg_manager import AWGManager
+        body = AWGManager(None)._render_start_script('awg2')
+        self.assertIn('[ -f "$CHAIN_GATE_MARKER" ] && [ -f "$EXIT_CONF" ]', body)
+
+    def test_failed_rebuild_keeps_the_cut_and_restores_the_record(self):
+        h = self.build(('exit-0', 'exit-1', 'exit-2'))
+        saved = copy.deepcopy(h.record()['exit_link'])
+        h.exit('exit-1').relay_error = 'transit port unreachable'
+        with self.assertRaises(ExitLinkError):
+            run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1', 'exit-2']))
+        # the entry was cut, never unlinked: the kill-switch still holds
+        self.assertIn('exit_chain_cut', [c[0] for c in h.awg().calls])
+        self.assertNotIn('exit_unlink', [c[0] for c in h.awg().calls])
+        # and the operator keeps his previous chain
+        self.assertEqual(h.record()['exit_link']['chain'], saved['chain'])
+
+    def test_remove_chain_survives_a_deleted_hop(self):
+        h = self.build(('exit-0', 'exit-1', 'exit-2'))
+        h.data['servers'] = [s for s in h.data['servers'] if s.get('uid') != 'exit-2']
+        result = run(h.service.remove_chain(0, 'awg2'))
+        self.assertTrue(result['unlinked'])
+        self.assertFalse(h.record().get('exit_link'))
+
+    def test_remove_chain_of_a_deleted_final_hop(self):
+        h = self.build(('exit-0', 'exit-1'))
+        h.data['servers'] = [s for s in h.data['servers'] if s.get('uid') != 'exit-1']
+        result = run(h.service.remove_chain(0, 'awg2'))
+        self.assertTrue(result['unlinked'])
+        self.assertFalse(h.record().get('exit_link'))
+
+    def test_single_link_to_chain_cleans_the_old_exit(self):
+        h = Harness()
+        run(h.service.link(0, 'awg2', 'exit-0'))
+        run(h.service.build_chain(0, 'awg2', ['exit-1', 'exit-2']))
+        removed = [c[2] for c in h.exit('exit-0').calls if c[0] == 'remove_peer']
+        self.assertIn('entry-uid:awg2', removed)
+
+    def test_legacy_chain_gets_a_relay_startup_block_from_the_panel(self):
+        from managers.exit_manager import ExitManager
+        h = self.build(('exit-0', 'exit-1'))
+        relay = h.record()['exit_link']['chain'][0]['relay']
+        relay.pop('rule_pref', None)
+        h.record()['exit_link'].pop('chain_prefix', None)   # a 0d2c509 record
+        h.sshes['203.0.113.5'].registry.clear()
+        # the panel passes its own relays even when the container registry is
+        # empty (a chain built before the registry existed)
+        passed = [c[1] for c in h.exit('exit-0').calls if c[0] == 'relay_write_startup']
+        self.assertTrue(passed)
+        self.assertIn(relay['iface'], passed[-1])
+        ssh = h.sshes['203.0.113.5']
+        manager = ExitManager.__new__(ExitManager)
+        manager.ssh = ssh
+        ifaces = manager.relay_write_startup(
+            [h.record()['exit_link']['chain'][0]['relay']])
+        self.assertEqual(ifaces, [relay['iface']])
+        body = ssh.uploads['/tmp/_amnz_relay_start.sh']
+        self.assertIn(relay['iface'], body)
+        # and the preference it reads back is the one that version installed
+        _record, chain = h.service._chain_record(h.data, h.record())
+        self.assertEqual(chain[0]['relay']['rule_pref'], 3000)
+
+    def test_legacy_chain_is_not_reported_broken(self):
+        h = self.build(('exit-0', 'exit-1'))
+        h.record()['exit_link']['chain'][0]['relay'].pop('rule_pref', None)
+        h.record()['exit_link'].pop('chain_prefix', None)
+        result = run(h.service.poll_chain(0, 'awg2'))
+        self.assertNotEqual(result['action'], 'gate_off')
+
+    def test_iface_collision_bumps_the_index_not_the_prefix(self):
+        h = Harness()
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        run(h.service.build_chain(0, 'awg', ['exit-0', 'exit-1']))
+        iface_a = h.record('awg2')['exit_link']['chain'][0]['relay']['iface']
+        iface_b = h.record('awg')['exit_link']['chain'][0]['relay']['iface']
+        self.assertNotEqual(iface_a, iface_b)
+
+    def test_shortening_a_chain_raises_the_mtu(self):
+        h = Harness()
+        h.awg().mtu = '1420'
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1', 'exit-2'],
+                                  mtu_override=True))
+        self.assertEqual(h.awg().applied_mtu, 1280)
+        run(h.service.build_chain(0, 'awg2', ['exit-0', 'exit-1']))
+        self.assertEqual(h.awg().applied_mtu, 1340)
+
+    def test_teardown_pending_survives_a_poll_and_shows_on_the_badge(self):
+        h = self.build(('exit-0', 'exit-1'))
+        h.awg().fail_unlink = True
+        with self.assertRaises(ExitLinkError):
+            run(h.service.remove_chain(0, 'awg2'))
+        self.assertEqual(h.record()['exit_link']['stale'], 'teardown_pending')
+        run(h.service.poll_chain(0, 'awg2'))
+        self.assertEqual(h.record()['exit_link']['stale'], 'teardown_pending')
+        self.assertEqual(h.service.chain_flags(h.data)['0']['stale'], 'teardown_pending')
+
+    def test_poll_records_the_probe_verdict_per_hop(self):
+        h = self.build()
+        result = run(h.service.poll_chain(0, 'awg2'))
+        self.assertTrue(all('probe_ok' in hop for hop in result['hops']))
+        self.assertTrue(all(hop['probe_ok'] for hop in result['hops']))
+
+    def test_relay_prefix_is_validated(self):
+        from managers.exit_manager import ExitManager
+        manager = ExitManager.__new__(ExitManager)
+        with self.assertRaises(ValueError):
+            manager._validate_relay({'iface': 'c1a2b1', 'table': 250,
+                                     'source_ip': '10.9.0.7', 'prefix': 'zz'})
+        manager._validate_relay({'iface': 'c1a2b1', 'table': 250,
+                                 'source_ip': '10.9.0.7', 'prefix': 'a1b2'})
+
+    def test_relay_guard_helper_is_idempotent(self):
+        from managers.exit_manager import ExitManager
+        manager = ExitManager.__new__(ExitManager)
+        body = ExitManager._relay_shell_functions(
+            manager, {'iface': 'c1a2b1', 'table': 250, 'source_ip': '10.9.0.7',
+                      'mtu': 1420, 'rule_pref': 3123})
+        self.assertIn('x_ipt_ins() { table="$1"; chain="$2"; pos="$3"; shift 3;', body)
+
+    def test_relay_teardown_removes_the_private_key(self):
+        from managers.exit_manager import ExitManager
+        ssh = FakeSSH('203.0.113.5')
+        manager = ExitManager.__new__(ExitManager)
+        manager.ssh = ssh
+        manager.relay_teardown({'iface': 'c1a2b1', 'table': 250,
+                                'source_ip': '10.9.0.7', 'mtu': 1420,
+                                'rule_pref': 3123})
+        self.assertTrue(any('_private.key' in cmd for cmd in ssh.commands))
