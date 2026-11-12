@@ -112,15 +112,19 @@ x_chain_gate() {
     # the table would hold two default routes and the check below could never
     # pass
     ip -4 route del default metric 1000 table $EXIT_TABLE 2>/dev/null
-    ip -4 route del default dev $EXIT_IF table $EXIT_TABLE 2>/dev/null
     ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
+    # ONE replace converts the exit0 default in place (same key): there is no
+    # moment where the table has no default and the FIB falls through to main
     ip -4 route replace blackhole default metric 0 table $EXIT_TABLE
+    ip -4 route del default dev $EXIT_IF table $EXIT_TABLE 2>/dev/null
     touch "$CHAIN_GATE_MARKER"
   else
+    # restore first, clean up second, and only then drop the marker: a failed
+    # restore must leave the fail-closed state (and its marker) intact
+    ip -4 route replace default dev $EXIT_IF table $EXIT_TABLE
     ip -4 route del blackhole default table $EXIT_TABLE 2>/dev/null
     ip -4 route del default metric 900 table $EXIT_TABLE 2>/dev/null
     ip -4 route del default metric 1000 table $EXIT_TABLE 2>/dev/null
-    ip -4 route replace default dev $EXIT_IF table $EXIT_TABLE
     rm -f "$CHAIN_GATE_MARKER"
   fi
   if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $X_SUBNET >/dev/null 2>&1; fi
@@ -131,7 +135,11 @@ x_chain_gate() {
     ip -4 route show table $EXIT_TABLE | grep -q "^blackhole default" || { echo "! FATAL: chain gate off is not in place"; return 3; }
   else
     [ "$(x_route_defaults $EXIT_TABLE)" = "1" ] || { echo "! FATAL: the table must hold exactly one default route"; return 3; }
-    ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF" || { echo "! FATAL: exit0 default is not restored"; return 3; }
+    ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF" || {
+      echo "! FATAL: exit0 default is not restored; the gate stays closed"
+      ip -4 route replace blackhole default metric 0 table $EXIT_TABLE
+      touch "$CHAIN_GATE_MARKER"
+      return 3; }
   fi
   echo "chain gate $1: $(ip -4 route show table $EXIT_TABLE | head -1)"
 }

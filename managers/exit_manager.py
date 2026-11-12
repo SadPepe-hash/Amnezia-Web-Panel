@@ -649,9 +649,11 @@ fi
             "  echo \"relay up: $R_SRC via $R_IF -> table $R_TABLE pref $R_PREF\"\n"
             "}\n"
             "x_relay_down() {\n"
-            "  [ -f \"$R_CONF\" ] && $X_QUICK down $R_CONF 2>/dev/null; ip link del $R_IF 2>/dev/null\n"
-            # cut first, then clean up: no window where the source can use eth0
+            # cut first, then clean up: the rule goes before the device, so the
+            # relayed source can never fall through to the main table (eth0)
             "  x_unrule -4 $R_PREF\n"
+            "  ip -4 route replace blackhole default metric 0 table $R_TABLE 2>/dev/null\n"
+            "  [ -f \"$R_CONF\" ] && $X_QUICK down $R_CONF 2>/dev/null; ip link del $R_IF 2>/dev/null\n"
             "  ip -4 route flush table $R_TABLE 2>/dev/null\n"
             "  x_ipt_del filter FORWARD -i transit0 -o eth0 -s $R_SRC -j DROP\n"
             "  x_ipt_del filter FORWARD -i transit0 -o $R_IF -s $R_SRC -j ACCEPT\n"
@@ -820,7 +822,9 @@ fi
         )
         relays = []
         if code != 0:
-            return relays
+            # unreadable is not the same as empty: the caller must keep the
+            # existing start.sh instead of erasing every relay block
+            return None
         current = {}
         for line in (out or '').splitlines():
             line = line.strip()
@@ -861,8 +865,17 @@ fi
         before the registry existed therefore still gets its block, and chains
         that share this host never lose each other's wiring. The block is
         spliced between markers (never re-rendered), so a WARP egress block or
-        any other local content survives."""
-        known = {relay['iface']: dict(relay) for relay in self.relay_read_registry()}
+        any other local content survives. When the registry cannot be read and
+        the panel passed nothing, the existing start.sh is left untouched."""
+        registry = self.relay_read_registry()
+        known = {}
+        if registry is None:
+            if not relays:
+                logger.warning("relay registry unreadable and no panel relays given: "
+                               "keeping the existing start.sh")
+                return []
+            registry = []
+        known = {relay['iface']: dict(relay) for relay in registry}
         for relay in relays or []:
             self._validate_relay(relay)
             known.setdefault(relay['iface'], dict(relay))

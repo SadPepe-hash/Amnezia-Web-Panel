@@ -278,3 +278,48 @@ it is fixed in the third round, again with one regression test each:
    badge, the per-hop probes run in parallel, the gate is retried once inside
    the same pass, `x_chain_cut` verifies like the gate, and a relay teardown
    also deletes the uplink private key.
+
+## Fourth audit round (both agents again)
+
+The re-audit found that the third round had again broken the feature; all of it
+is fixed in the fourth round, again with one regression test each:
+
+1. **The gate ON direction was not atomic** (inferx N1, critical): it deleted
+   the blackhole first and installed the exit0 default afterwards, dropping the
+   marker before verification - so a failed restore left table 200 with no
+   default, the FIB fell through to the main table and the clients left via
+   eth0 with no marker and no retry. Now: one `replace` converts the route, the
+   leftovers are deleted after, the marker goes last, and a failed restore
+   re-arms the blackhole and returns 3. The same ordering is used in the OFF
+   direction and in `x_relay_down` (rule before device, inferx N8).
+2. **single -> chain rollback left a dead record** (inferx N2): the old single
+   link was torn down before the build, and the rollback left the record
+   claiming a link whose wiring was gone. Now the record is dropped and the
+   egress stays cut until the operator acts.
+3. **A failed rebuild restored a lying record** (inferx N6): the previous chain
+   came back with `stale=None` while its relays, peers and startup blocks were
+   destroyed. Now it is restored as `chain_rebuild_failed` (repair required) and
+   the host startup is refreshed from the panel state.
+4. **A 1-hop chain record was unsavable / recursed** (inferx N3 + nemotron N1):
+   `chain_view` reported mode='single' for a one-hop chain and the UI bounced
+   between the two save functions. Now the mode reflects the STORED record and
+   `chainModeStored()` drives the dispatch, so any chain-shaped record goes
+   through the chain API.
+5. **The MTU retry never sent `mtu_override`** (inferx N4): the confirm/retry
+   loop was endless, so a 2+ hop chain at MTU 1420 could not be built from the
+   UI at all. The retry now carries both flags; a low MTU is only raised when
+   the operator asks (`raise_mtu`), never silently (inferx N12).
+6. **ping-only probes claimed reachability** (inferx N5): the port check was
+   skipped when ICMP answered. Now the script always runs both checks and
+   reports a distinct `ping`/`port_unverified` state, with a UI hint.
+7. **Deleting a chain hop server left orphans** (inferx N7 + nemotron N2):
+   only hop 0 was matched by the cleanup, so middleware hops left live relays,
+   keys and startup blocks. The delete/clear paths now unwind every chain that
+   contains the server (`remove_chain`, which tolerates the vanished hop) and
+   mark stale for panels left behind.
+8. **Everything else**: saving the poll settings no longer wipes the per-hop
+   table (N9); an unreadable container registry keeps the existing start.sh
+   instead of erasing every block (N10 + nemotron N3); a failed cut aborts the
+   rebuild instead of being swallowed (N11); every build/remove refreshes the
+   union of all chains on the host (N2nemotron); the hop table numbers are
+   escaped (N13); the probe validates `after_uid` on the chain (nemotron N7).

@@ -1242,7 +1242,11 @@ class ExitLinkService:
             try:
                 await asyncio.to_thread(awg.exit_chain_cut, protocol)
             except Exception as err:
-                logger.warning("entry cut during chain teardown failed: %s", err)
+                # the cut is the fail-closed guarantee of the whole rebuild:
+                # without it the entry keeps forwarding into the chain being
+                # replaced, so the rebuild must not start
+                raise ExitLinkError('chain_cut_failed',
+                                    f'Could not close the egress for the rebuild: {err}')
         elif entry_action == 'unlink':
             try:
                 await asyncio.to_thread(awg.exit_unlink, protocol)
@@ -1317,7 +1321,7 @@ class ExitLinkService:
             self.save_data(data)
 
     async def build_chain(self, entry_server_id, protocol, chain_uids, *, force=False,
-                          mtu_override=False, source='manual', _locked=False):
+                          mtu_override=False, raise_mtu=False, source='manual', _locked=False):
         """Build (or rebuild) an ordered chain of exit nodes on one instance.
 
         Dispatcher: the real work runs under the per-instance lock, unless the
@@ -1335,14 +1339,14 @@ class ExitLinkService:
         if _locked:
             return await self._build_chain(entry_server_id, protocol, chain_uids,
                                            force=force, mtu_override=mtu_override,
-                                           source=source)
+                                           raise_mtu=raise_mtu, source=source)
         async with self._locks[(entry_uid, protocol)]:
             return await self._build_chain(entry_server_id, protocol, chain_uids,
                                            force=force, mtu_override=mtu_override,
-                                           source=source)
+                                           raise_mtu=raise_mtu, source=source)
 
     async def _build_chain(self, entry_server_id, protocol, chain_uids, *, force=False,
-                           mtu_override=False, source='manual'):
+                           mtu_override=False, raise_mtu=False, source='manual'):
         """The entry links to hop 0 exactly like a single exit link; every hop
         in the middle additionally runs its own uplink towards the next hop.
         One failure anywhere tears the whole attempt down: a half-applied chain
@@ -1395,21 +1399,29 @@ class ExitLinkService:
         warnings = []
         mtu_adjusted = False
         if mtu and mtu != target_mtu:
-            if mtu > target_mtu and not mtu_override:
-                raise ExitLinkError(
-                    'chain_mtu_override_required',
-                    f'Client MTU {mtu} cannot survive {hops_count} hops; '
-                    f'it must be lowered to {target_mtu}. Apply the new MTU?')
             if mtu > target_mtu:
+                if not mtu_override:
+                    raise ExitLinkError(
+                        'chain_mtu_override_required',
+                        f'Client MTU {mtu} cannot survive {hops_count} hops; '
+                        f'it must be lowered to {target_mtu}. Apply the new MTU?')
                 warnings.append('exit_chain_mtu_lowered')
             else:
-                warnings.append('exit_chain_mtu_raised')
-            try:
-                await asyncio.to_thread(awg.update_awg_settings, protocol, mtu=target_mtu)
-                mtu_adjusted = True
-            except Exception as err:
-                raise ExitLinkError('exit_apply_failed',
-                                    f'Could not apply the chain MTU {target_mtu}: {err}')
+                # raising back is an operator decision too: an instance parked
+                # at a low MTU on purpose must not be pushed up by a 1-hop chain
+                if not raise_mtu:
+                    warnings.append('exit_chain_mtu_kept_low')
+                    target_mtu = mtu
+                    mtu = None
+                else:
+                    warnings.append('exit_chain_mtu_raised')
+            if mtu:
+                try:
+                    await asyncio.to_thread(awg.update_awg_settings, protocol, mtu=target_mtu)
+                    mtu_adjusted = True
+                except Exception as err:
+                    raise ExitLinkError('exit_apply_failed',
+                                        f'Could not apply the chain MTU {target_mtu}: {err}')
 
         # A previous chain is never left half-alive: interfaces, rules,
         # peers and start.sh blocks of hops that are gone come down first.
@@ -1422,22 +1434,21 @@ class ExitLinkService:
             data = self.load_data()
             entry, rec = self._entry_by_uid(data, entry['uid'], protocol)
             previous = rec.get('exit_link') or {}
-        elif previous.get('exit_uid'):
-            # a plain single link is being replaced by a chain: the old exit
-            # keeps no orphan peer for a link the panel no longer knows
-            previous_record = copy.deepcopy(previous)
-            try:
-                awg = await self._awg(entry)
-                await asyncio.to_thread(awg.exit_unlink, protocol)
-                old_srv, _ = self._exit(data, previous['exit_uid'])
-                old_manager = await self._exit_manager(old_srv)
-                await asyncio.to_thread(old_manager.remove_peer, None,
-                                        peer_id_for(entry['uid'], protocol))
-            except Exception as err:
-                logger.warning("could not clean the previous single link before the chain: %s", err)
-                warnings.append('exit_old_link_cleanup_failed')
         else:
-            previous_record = {}
+            previous_record = copy.deepcopy(previous) if previous.get('exit_uid') else {}
+            if previous_record:
+                # a plain single link is being replaced by a chain: the old exit
+                # keeps no orphan peer for a link the panel no longer knows
+                try:
+                    awg = await self._awg(entry)
+                    await asyncio.to_thread(awg.exit_unlink, protocol)
+                    old_srv, _ = self._exit(data, previous['exit_uid'])
+                    old_manager = await self._exit_manager(old_srv)
+                    await asyncio.to_thread(old_manager.remove_peer, None,
+                                            peer_id_for(entry['uid'], protocol))
+                except Exception as err:
+                    logger.warning("could not clean the previous single link before the chain: %s", err)
+                    warnings.append('exit_old_link_cleanup_failed')
         built, hop_records = [], []
         prev_uplink_pub = None
         try:
@@ -1544,17 +1555,36 @@ class ExitLinkService:
             # cut stays, the previous chain is restored so the operator keeps his
             # configuration, and the adjusted MTU goes back.
             if previous_record.get('chain'):
+                # keep the egress cut and bring the previous chain back as a
+                # HONEST record: its wiring was destroyed by the teardown, so
+                # the operator must be told a repair is needed, never shown a
+                # healthy link whose traffic goes nowhere
                 try:
                     awg = await self._awg(entry)
                     await asyncio.to_thread(awg.exit_chain_cut, protocol)
                 except Exception as err:
                     logger.warning("could not keep the egress cut after a failed rebuild: %s", err)
+                restored = copy.deepcopy(previous_record)
+                restored['stale'] = 'chain_rebuild_failed'
                 try:
                     await self._update_record(
                         entry['uid'], protocol,
-                        lambda r: r.update({'exit_link': previous_record}))
+                        lambda r: r.update({'exit_link': restored}))
+                    await self._refresh_relay_startup()
                 except Exception as err:
                     logger.warning("could not restore the previous chain after a failed rebuild: %s", err)
+            elif previous_record.get('exit_uid'):
+                # a single link was torn down to make room for the chain: it is
+                # gone, so never leave a record pointing at wiring that does not
+                # exist. The egress stays cut until the operator acts.
+                try:
+                    await asyncio.to_thread(awg.exit_chain_cut, protocol)
+                except Exception as err:
+                    logger.warning("could not keep the egress cut after a failed chain build: %s", err)
+                try:
+                    await self._update_record(entry['uid'], protocol, lambda r: r.pop('exit_link', None))
+                except Exception as err:
+                    logger.warning("could not drop the stale single-link record: %s", err)
             else:
                 await self._rollback_chain(built)
             if mtu_adjusted and mtu:
@@ -1587,7 +1617,7 @@ class ExitLinkService:
             if mtu_adjusted and mtu:
                 await self._restore_mtu(awg, protocol, mtu)
             raise
-        await self._refresh_relay_startup(self._relay_hosts(hop_records))
+        await self._refresh_relay_startup()
         # the chain is up and every hop passed its handshake check: the egress
         # cut taken for the rebuild is lifted now
         try:
@@ -1782,13 +1812,12 @@ class ExitLinkService:
             'h=%s; p=%s; rtt=""; verified="no"; '
             'if command -v ping >/dev/null 2>&1; then '
             "rtt=$(ping -c1 -W2 -n \"$h\" 2>/dev/null | sed -n 's/.*time=\\([0-9.]*\\).*/\\1/p' | head -1); fi; "
-            'if [ -n "$rtt" ]; then verified="both"; '
-            'else '
             's=$(date +%%s%%N); timeout 3 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null; rc=$?; '
             'e=$(date +%%s%%N); '
-            'if [ $rc -eq 0 ]; then rtt=$(( (e-s)/1000000 )); verified="both"; '
-            'else verified="none"; fi; '
-            'fi; '
+            'if [ $rc -eq 0 ]; then verified="both"; '
+            'if [ -z "$rtt" ]; then rtt=$(( (e-s)/1000000 )); fi; '
+            'elif [ -n "$rtt" ]; then verified="ping"; '
+            'else verified="none"; rtt=""; fi; '
             'echo "$rtt $verified"' % (host_arg, port_arg))
         try:
             # a compound script: sudo covers only the first command of a plain
@@ -1809,6 +1838,10 @@ class ExitLinkService:
         verified = parts[1] if len(parts) > 1 else 'no'
         if rtt_ms is None or verified == 'none':
             return False, None, 'probe_failed'
+        if verified == 'ping':
+            # latency is known, but the transit port did not answer: the hop is
+            # not proven reachable even though ICMP is
+            return True, rtt_ms, 'port_unverified'
         return True, rtt_ms, None
 
     @staticmethod
@@ -1919,8 +1952,15 @@ class ExitLinkService:
             })
         fo = rec.get('exit_failover') if isinstance(rec, dict) else None
         failover_blocked = len(chain) > 1 and bool((fo or {}).get('enabled') is False)
+        # "chain" means the STORED record is chain-shaped: a legacy single
+        # link (no chain key) stays on the single-link API, while a one-hop
+        # chain record must be edited through the chain API
+        stored = (rec.get('exit_link') or {}) if isinstance(rec, dict) else {}
+        # "chain" means the record is chain-shaped: even a one-hop chain record
+        # must be edited through the chain API, or the single-link endpoint
+        # would refuse it
         return {
-            'mode': 'chain' if len(chain) > 1 else 'single',
+            'mode': 'chain' if (isinstance(stored.get('chain'), list) and stored.get('chain')) else 'single',
             'chain': hops_view,
             'chain_prefix': record.get('chain_prefix'),
             'client_mtu': record.get('client_mtu'),
@@ -2082,6 +2122,13 @@ class ExitLinkService:
         if gate_applied is None and broken_now:
             # the fail-closed gate could not be applied: the badge must say so
             stale = 'chain_gate_apply_failed'
+        if gate_applied is None and not broken_now and action == chain_policy.ACTION_GATE_ON:
+            # the egress could not be reopened: keep the gate closed and let the
+            # badge show it, so the next pass retries instead of trusting a
+            # chain whose traffic is still blackholed
+            state['gate'] = 'off'
+            state['last_reason'] = 'gate_open_failed'
+            stale = 'chain_gate_apply_failed'
 
         def mutate(r):
             link = r.get('exit_link')
@@ -2234,6 +2281,8 @@ class ExitLinkService:
             payload = dict(merged)
             payload['state'] = state
             payload['events'] = events
+            # the stored per-hop results survive a settings change
+            payload['hops'] = list(stored.get('hops') or [])
             r['exit_chain_poll'] = payload
 
         await self._update_record(entry['uid'], protocol, mutate)

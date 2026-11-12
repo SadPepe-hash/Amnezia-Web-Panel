@@ -4556,7 +4556,7 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
                                 continue
                             for record in (other.get('protocols') or {}).values():
                                 link = record.get('exit_link') or {}
-                                if link.get('exit_uid') == uid:
+                                if link.get('exit_uid') == uid or uid in chain_policy.chain_uids(link):
                                     link['stale'] = 'exit_server_removed_from_panel'
 
                         data['servers'].pop(index)
@@ -4588,6 +4588,21 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
                         'archived': len(blocked),
                     }
                 results = []
+                # chains that use this server as ANY hop are unwound first (see
+                # clear()): the single-link detach only sees hop 0.
+                # A failure here must not block the deletion.
+                try:
+                    snapshot = load_data()
+                    for other in snapshot.get('servers', []):
+                        if other.get('uid') == uid:
+                            continue
+                        for proto, rec in (other.get('protocols') or {}).items():
+                            link = rec.get('exit_link') or {}
+                            if link.get('chain') and uid in chain_policy.chain_uids(link):
+                                await exit_link_svc.remove_chain(
+                                    snapshot.get('servers', []).index(other), proto)
+                except Exception as err:
+                    logger.warning('could not unwind chains of deleted exit %s: %s', uid, err)
                 if (server.get('protocols') or {}).get('exit'):
                     results.extend(await exit_link_svc.detach_entries_for_exit(uid, 'exit_server_deleted'))
                 results.extend(await exit_link_svc.forget_entry_peers(server))
@@ -4730,6 +4745,21 @@ async def api_clear_server(request: Request, server_id: int, server_uid: Optiona
                 _, server = find_server_by_uid(load_data(), uid)
                 if not unchanged(server):
                     return JSONResponse({'error': 'Server changed before cleanup'}, status_code=409)
+            # chains that use this server as ANY hop must be unwound first:
+            # their relays, peers and startup blocks live on other hosts, and
+            # the single-link detach below only sees hop 0. A failure here
+            # must not block the cleanup the operator asked for.
+            try:
+                for other in data.get('servers', []):
+                    if other.get('uid') == uid:
+                        continue
+                    for proto, rec in (other.get('protocols') or {}).items():
+                        link = rec.get('exit_link') or {}
+                        if link.get('chain') and uid in chain_policy.chain_uids(link):
+                            await exit_link_svc.remove_chain(
+                                data.get('servers', []).index(other), proto)
+            except Exception as err:
+                logger.warning('could not unwind chains of exit %s: %s', uid, err)
             results = []
             if (server.get('protocols') or {}).get('exit'):
                 results.extend(await exit_link_svc.detach_entries_for_exit(uid, 'exit_cleared'))

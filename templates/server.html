@@ -5752,11 +5752,17 @@
         }
     }
 
+    function chainModeStored() {
+        if (currentExitChainView && currentExitChainView.mode === 'chain') return true;
+        if (currentExitChain && currentExitChain.length > 1) return true;
+        const link = currentExitLinkState && currentExitLinkState.exit_link;
+        return !!(link && Array.isArray(link.chain) && link.chain.length > 0);
+    }
+
     async function saveExitLink(force = false) {
         // a record that came from the chain API stays on the chain API, even
         // when the operator trimmed it down to one hop
-        if ((currentExitChainView && currentExitChainView.mode === 'chain')
-            || (currentExitChain && currentExitChain.length > 1)) {
+        if (chainModeStored()) {
             return saveExitChain(false);
         }
         const uid = document.getElementById('exitLinkSelect').value;
@@ -5766,7 +5772,7 @@
     }
 
     async function removeExitLink() {
-        if (currentExitChainView && currentExitChainView.mode === 'chain') {
+        if (chainModeStored()) {
             return removeExitChain();
         }
         if (currentExitChain && currentExitChain.length > 1) {
@@ -5878,11 +5884,11 @@
                 <th>${_('exit_chain_hop')}</th><th>${_('exit_chain_col_name')}</th><th>${_('exit_chain_col_status')}</th>
                 <th>${_('exit_chain_col_rtt')}</th><th>${_('exit_chain_col_handshake')}</th><th>${_('exit_chain_col_traffic')}</th>
                 </tr></thead><tbody>` + hops.map(h => `<tr>
-                <td>${h.index + 1}</td>
+                <td>${escapeHtml(String(h.index + 1))}</td>
                 <td>${escapeHtml(currentExitChain.length > h.index ? exitChainHopLabel(currentExitChain[h.index]) : (h.uid || ''))}</td>
                 <td>${exitChainStatusBadge(h)}</td>
                 <td>${h.rtt_ms !== null && h.rtt_ms !== undefined ? Math.round(h.rtt_ms) + ' ms' : '—'}</td>
-                <td>${h.handshake_age !== null && h.handshake_age !== undefined ? _('exit_chain_handshake_ago').replace('{s}', h.handshake_age) : '—'}</td>
+                <td>${h.handshake_age !== null && h.handshake_age !== undefined ? _('exit_chain_handshake_ago').replace('{s}', escapeHtml(String(h.handshake_age))) : '—'}</td>
                 <td>${formatBytes(h.rx_bytes || 0)} ↓ ${formatBytes(h.tx_bytes || 0)} ↑</td>
                 </tr>`).join('') + `</tbody></table></div>`;
         }
@@ -5938,12 +5944,15 @@
         document.getElementById('exitSingleGroup').classList.toggle('hidden', chainMode);
     }
 
-    async function saveExitChain(force = false) {
+    async function saveExitChain(force = false, mtuOverride = false) {
         if (!currentExitChain.length) { showToast(_('exit_chain_empty'), 'error'); return; }
-        if (currentExitChain.length === 1) {
+        // a one-hop chain is still a chain: it goes through the chain API, not
+        // the single-link endpoint (which refuses chain records)
+        if (currentExitChain.length === 1 && !chainModeStored()) {
             return saveExitLink(force);
         }
-        const body = { protocol: currentExitLinkProto, chain: currentExitChain, force };
+        const body = { protocol: currentExitLinkProto, chain: currentExitChain,
+                       force, mtu_override: mtuOverride };
         try {
             const res = await apiCall(`/api/servers/${SERVER_ID}/exit-link/chain`, 'POST', body);
             (res.warnings || []).forEach(w => showToast(_(w), 'info'));
@@ -5954,7 +5963,7 @@
             const text = EXIT_LINK_ERROR_KEYS.includes(err.message) ? _(err.message) : err.message;
             if (err.message === 'chain_mtu_override_required') {
                 if (confirm(`${text}\n\n${_('exit_link_force')}?`)) {
-                    return saveExitChain(true);
+                    return saveExitChain(true, true);
                 }
                 return;
             }
