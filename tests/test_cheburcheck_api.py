@@ -570,6 +570,15 @@ class TokenCheckTests(CheburcheckApiTests):
 
     URL = '/api/settings/cheburcheck/token_check'
 
+    def test_validation_errors_do_not_echo_token_input(self):
+        marker = 'mock-cheburcheck-token'
+        paths = ('/api/settings/cheburcheck', self.URL)
+        for path in paths:
+            with self.subTest(path=path):
+                response = self.client.post(path, json={'api_token': [marker]})
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(response.json(), {'error': 'Invalid Cheburcheck request'})
+
     def test_without_token_reports_it(self):
         r = self.client.post(self.URL, json={})
         self.assertEqual(r.status_code, 200, r.text)

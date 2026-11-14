@@ -148,18 +148,23 @@ async def api_json_error_handler(request: Request, exc: Exception):
     return PlainTextResponse('Internal Server Error', status_code=500)
 
 
-# IPv6 mutation endpoints document a 400 bad_request for a malformed body,
-# while every other endpoint keeps FastAPI's stock 422 detail array. Only
-# these paths are remapped; the body model lives in the handlers below.
+# IPv6 mutation endpoints document a 400 bad_request for a malformed body.
 _IPV6_BAD_BODY_PATH = re.compile(
     r'^/api/servers/[^/]+/(?:ipv6|docker/ipv6/apply|protocol/[^/]+/ipv6)$')
+_CHEBURCHECK_TOKEN_PATHS = {
+    '/api/settings/cheburcheck',
+    '/api/settings/cheburcheck/token_check',
+}
 
 
 @app.exception_handler(RequestValidationError)
-async def ipv6_validation_error_handler(request: Request, exc: RequestValidationError):
+async def request_validation_error_handler(request: Request, exc: RequestValidationError):
     if _IPV6_BAD_BODY_PATH.match(request.url.path):
         return JSONResponse({'error': 'bad_request', 'code': 'bad_request'},
                             status_code=400)
+    if request.url.path in _CHEBURCHECK_TOKEN_PATHS:
+        # FastAPI can include rejected input values in validation errors.
+        return JSONResponse({'error': 'Invalid Cheburcheck request'}, status_code=422)
     return await request_validation_exception_handler(request, exc)
 
 
