@@ -66,6 +66,26 @@ from managers.awg_junk import (
 )
 from managers.awg_manager import AWGManager, ICMP_ECHO_ALLOW_SCRIPT, normalize_special_junk
 from server_stats import collect_host_stats
+from diagnostics_service import (
+    DEFAULT_TARGETS as DIAG_DEFAULT_TARGETS,
+    LOSS_INSTALL as DIAG_LOSS_INSTALL,
+    PROBE_COMMAND as DIAG_PROBE_COMMAND,
+    SPEEDTEST_INSTALL as DIAG_SPEEDTEST_INSTALL,
+    SPEEDTEST_JOB_DIR as DIAG_SPEEDTEST_JOB_DIR,
+    DiagnosticsStore,
+    add_target as diag_add_target,
+    parse_ping as diag_parse_ping,
+    parse_probe as diag_parse_probe,
+    parse_speedtest as diag_parse_speedtest,
+    parse_speedtest_progress as diag_parse_speedtest_progress,
+    ping_command as diag_ping_command,
+    remove_target as diag_remove_target,
+    speedtest_command as diag_speedtest_command,
+    speedtest_job_start as diag_speedtest_job_start,
+    speedtest_progress_command as diag_speedtest_progress_command,
+    speedtest_stop_command as diag_speedtest_stop_command,
+    state_view as diag_state_view,
+)
 from managers.awg_plugin_updater import (
     COMPONENTS as AWG_PLUGIN_COMPONENTS,
     TOTAL_STEPS as AWG_PLUGIN_TOTAL_STEPS,
@@ -14415,6 +14435,428 @@ def pathlib_read_data_bytes():
     with open(DATA_FILE, 'rb') as source:
         return source.read()
 
+
+# ===== Network diagnostics add-ons: Ookla Speedtest + packet loss =====
+#
+# Two marketplace add-ons measure the server's own channel, on demand only:
+#   speedtest - Ookla Speedtest CLI from Ookla's apt repository (license is
+#               accepted per run with --accept-license --accept-gdpr)
+#   loss      - iputils-ping for the measurement + mtr-tiny for per-hop loss
+# Nothing polls in the background: a run is one explicit admin request, and
+# results live in .diagnostics_state.json, never in a data.json snapshot.
+
+DIAG_STATE_PATH = DATA_FILE + '.diagnostics_state.json'
+diag_store = DiagnosticsStore(DIAG_STATE_PATH)
+_DIAG_ACTIVE = set()
+_DIAG_STARTED = {}
+_DIAG_ACTIVE_LOCK = threading.Lock()
+
+
+def _diag_server(server_id):
+    servers = load_data().get('servers') or []
+    if not isinstance(server_id, int) or not 0 <= server_id < len(servers):
+        return None
+    return servers[server_id]
+
+
+def _diag_uid(server, server_id):
+    return str(server.get('uid') or server.get('host') or server_id)
+
+
+def _diag_begin(server_uid, kind):
+    """One measurement per server and kind: two speedtests would halve both."""
+    key = (server_uid, kind)
+    with _DIAG_ACTIVE_LOCK:
+        if key in _DIAG_ACTIVE:
+            return None
+        _DIAG_ACTIVE.add(key)
+        return key
+
+
+def _diag_end(key):
+    with _DIAG_ACTIVE_LOCK:
+        _DIAG_ACTIVE.discard(key)
+        _DIAG_STARTED.pop(key, None)
+
+
+def _diag_ssh(server, command, timeout):
+    ssh = get_ssh(server)
+    ssh.connect()
+    try:
+        out, err, code = ssh.run_command(command, timeout=timeout)
+    finally:
+        ssh.disconnect()
+    return (out or ''), (err or ''), code
+
+
+async def _diag_body(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    return payload if isinstance(payload, dict) else {}
+
+
+def _diag_failure(code, message, status):
+    return JSONResponse({'error': message, 'code': code}, status_code=status)
+
+
+@app.get('/api/servers/{server_id}/diagnostics/status', tags=["Servers"])
+def api_diag_status(request: Request, server_id: int):
+    """Stored add-on state: installed apps, targets and the last measurements."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    return diag_store.read(_diag_uid(server, server_id))
+
+
+@app.post('/api/servers/{server_id}/diagnostics/probe', tags=["Servers"])
+def api_diag_probe(request: Request, server_id: int):
+    """Ask the host whether speedtest/mtr/ping are actually present."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    uid = _diag_uid(server, server_id)
+    key = _diag_begin(uid, 'probe')
+    if key is None:
+        return _diag_failure('busy', 'Diagnostics is already running', 409)
+    try:
+        try:
+            out, err, _ = _diag_ssh(server, DIAG_PROBE_COMMAND, 20)
+        except Exception as exc:
+            logger.exception('Diagnostics probe failed')
+            return _diag_failure('ssh_failed', str(exc) or 'SSH failed', 502)
+        apps = diag_parse_probe(out)
+        at = int(time.time())
+        for app in apps.values():
+            app['at'] = at
+
+        def apply(record):
+            record['apps'] = apps
+            return diag_state_view(record)
+
+        return diag_store.update(uid, apply)
+    finally:
+        _diag_end(key)
+
+
+@app.post('/api/servers/{server_id}/diagnostics/install', tags=["Servers"])
+async def api_diag_install(request: Request, server_id: int):
+    """Install one add-on: ``{"app": "speedtest"|"loss"}``."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    body = await _diag_body(request)
+    app_name = str(body.get('app') or '')
+    commands = {'speedtest': DIAG_SPEEDTEST_INSTALL, 'loss': DIAG_LOSS_INSTALL}
+    if app_name not in commands:
+        return _diag_failure('invalid_app', 'Unknown add-on', 400)
+    uid = _diag_uid(server, server_id)
+    key = _diag_begin(uid, 'install')
+    if key is None:
+        return _diag_failure('busy', 'An add-on install is already running', 409)
+    try:
+        try:
+            out, err, code = await asyncio.to_thread(
+                _diag_ssh, server, commands[app_name], 300)
+        except Exception as exc:
+            logger.exception('Diagnostics install failed')
+            return _diag_failure('install_failed', str(exc) or 'Install failed', 502)
+        if code != 0:
+            detail = (err or out).strip().splitlines()[-1:] or ['install failed']
+            return _diag_failure('install_failed', detail[0][:300], 502)
+        # Record what is really on the host, not what the installer promised.
+        try:
+            probe_out, _, _ = await asyncio.to_thread(
+                _diag_ssh, server, DIAG_PROBE_COMMAND, 20)
+            apps = diag_parse_probe(probe_out)
+        except Exception:
+            apps = {app_name: {'installed': True, 'version': ''}}
+        at = int(time.time())
+        for app in apps.values():
+            app['at'] = at
+
+        def apply(record):
+            record.setdefault('apps', {}).update(apps)
+            return diag_state_view(record)
+
+        return diag_store.update(uid, apply)
+    finally:
+        _diag_end(key)
+
+
+@app.post('/api/servers/{server_id}/diagnostics/speedtest', tags=["Servers"])
+async def api_diag_speedtest(request: Request, server_id: int):
+    """Run Ookla Speedtest once against the server's own uplink."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    uid = _diag_uid(server, server_id)
+    key = _diag_begin(uid, 'speedtest')
+    if key is None:
+        return _diag_failure('busy', 'Speedtest is already running', 409)
+    try:
+        state = diag_store.read(uid)
+        speed_app = (state.get('apps') or {}).get('speedtest') or {}
+        if speed_app and not speed_app.get('installed'):
+            return _diag_failure(
+                'not_installed', 'Speedtest (Ookla) is not installed', 409)
+        command = diag_speedtest_command(speed_app.get('path'))
+        try:
+            out, err, code = await asyncio.to_thread(
+                _diag_ssh, server, command, 180)
+        except Exception as exc:
+            logger.exception('Speedtest run failed')
+            return _diag_failure('ssh_failed', str(exc) or 'SSH failed', 502)
+        if code != 0 and re.search(r'speedtest:\s*(command\s+)?not found',
+                                   err + '\n' + out):
+            return _diag_failure(
+                'not_installed', 'Speedtest is not installed', 409)
+        combined = (err or '') + '\n' + (out or '')
+        if 'ConfigurationError' in combined or \
+                'Could not retrieve or read configuration' in combined:
+            logger.warning('Speedtest config endpoint unreachable: %r',
+                           combined.strip()[-300:])
+            return _diag_failure(
+                'speedtest_unreachable',
+                'Speedtest cannot reach cli.speedtest.net / www.speedtest.net', 502)
+        if code != 0:
+            detail = (err or out).strip().splitlines()[-1:] or ['speedtest failed']
+            return _diag_failure('speedtest_failed', detail[0][:300], 502)
+        if not (out or '').strip():
+            # A look-alike CLI (speedtest-cli) exits 0 with empty stdout on
+            # Ookla flags; that is "not installed", not an unreadable result.
+            return _diag_failure(
+                'not_installed', 'Speedtest (Ookla) is not installed', 409)
+        try:
+            result = diag_parse_speedtest(out)
+        except ValueError:
+            logger.warning('Unreadable speedtest output: %r', (out or '')[:300])
+            return _diag_failure('speedtest_failed', 'Unreadable speedtest output', 502)
+
+        def apply(record):
+            record['speedtest'] = result
+            return diag_state_view(record)
+
+        return diag_store.update(uid, apply)
+    finally:
+        _diag_end(key)
+
+
+@app.post('/api/servers/{server_id}/diagnostics/speedtest/start', tags=["Servers"])
+async def api_diag_speedtest_start(request: Request, server_id: int):
+    """Start Ookla detached on the host and let the page poll its JSONL tail."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    uid = _diag_uid(server, server_id)
+    key = _diag_begin(uid, 'speedtest')
+    if key is None:
+        return _diag_failure('busy', 'Speedtest is already running', 409)
+    state = diag_store.read(uid)
+    speed_app = (state.get('apps') or {}).get('speedtest') or {}
+    if speed_app and not speed_app.get('installed'):
+        _diag_end(key)
+        return _diag_failure(
+            'not_installed', 'Speedtest (Ookla) is not installed', 409)
+    try:
+        out, err, code = await asyncio.to_thread(
+            _diag_ssh, server,
+            diag_speedtest_job_start(speed_app.get('path')), 30)
+    except Exception as exc:
+        _diag_end(key)
+        logger.exception('Speedtest start failed')
+        return _diag_failure('ssh_failed', str(exc) or 'SSH failed', 502)
+    if code != 0:
+        _diag_end(key)
+        detail = (err or out).strip().splitlines()[-1:] or ['start failed']
+        return _diag_failure('speedtest_failed', detail[0][:300], 502)
+    with _DIAG_ACTIVE_LOCK:
+        _DIAG_STARTED[key] = time.time()
+    return {'status': 'started'}
+
+
+@app.get('/api/servers/{server_id}/diagnostics/speedtest/progress', tags=["Servers"])
+async def api_diag_speedtest_progress(request: Request, server_id: int):
+    """Poll the detached run: real download/upload numbers, then the result."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    uid = _diag_uid(server, server_id)
+    key = (uid, 'speedtest')
+    if key not in _DIAG_ACTIVE:
+        return {'state': 'idle'}
+    try:
+        out, err, _ = await asyncio.to_thread(
+            _diag_ssh, server, diag_speedtest_progress_command(), 30)
+    except Exception as exc:
+        _diag_end(key)
+        logger.exception('Speedtest progress failed')
+        return _diag_failure('ssh_failed', str(exc) or 'SSH failed', 502)
+    state = diag_parse_speedtest_progress(out)
+    if state.get('state') == 'done' and state.get('result'):
+        result = state['result']
+
+        def apply(record):
+            record['speedtest'] = result
+            return diag_state_view(record)
+
+        diag_store.update(uid, apply)
+        _diag_end(key)
+        return {'state': 'done', 'result': result}
+    if state.get('state') == 'failed':
+        _diag_end(key)
+        detail = (state.get('error') or err or 'speedtest failed').strip()
+        return _diag_failure('speedtest_failed', detail[-300:], 502)
+    started = _DIAG_STARTED.get(key)
+    if started and time.time() - started > 240:
+        try:
+            await asyncio.to_thread(
+                _diag_ssh, server,
+                'kill "$(cat %s/pid)" 2>/dev/null' % DIAG_SPEEDTEST_JOB_DIR, 10)
+        except Exception:
+            pass
+        _diag_end(key)
+        return _diag_failure('speedtest_timeout', 'Speedtest timed out', 504)
+    return state
+
+
+@app.post('/api/servers/{server_id}/diagnostics/speedtest/cancel', tags=["Servers"])
+async def api_diag_speedtest_cancel(request: Request, server_id: int):
+    """Abort a running speedtest: closing the modal must not leave it running.
+
+    The process is killed by its group (start uses setsid), the busy slot is
+    released, and stale pid/rc files are removed so the next start is clean.
+    """
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    uid = _diag_uid(server, server_id)
+    key = (uid, 'speedtest')
+    if key not in _DIAG_ACTIVE:
+        return {'state': 'idle'}
+    try:
+        await asyncio.to_thread(
+            _diag_ssh, server, diag_speedtest_stop_command(), 20)
+    except Exception:
+        logger.warning('Speedtest cancel: stop command failed', exc_info=True)
+    _diag_end(key)
+    return {'state': 'cancelled'}
+
+
+@app.post('/api/servers/{server_id}/diagnostics/loss', tags=["Servers"])
+async def api_diag_loss(request: Request, server_id: int):
+    """Ping every saved target once; results are merged into the store."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    uid = _diag_uid(server, server_id)
+    key = _diag_begin(uid, 'loss')
+    if key is None:
+        return _diag_failure('busy', 'A packet-loss check is already running', 409)
+    try:
+        targets = diag_store.read(uid)['targets']
+        if not targets:
+            return _diag_failure('no_targets', 'No ping targets configured', 409)
+
+        def measure():
+            results = {}
+            for target in targets:
+                try:
+                    out, err, code = _diag_ssh(
+                        server, diag_ping_command(target), 45)
+                except Exception as exc:
+                    results[target] = {'error': str(exc) or 'ping_failed'}
+                    continue
+                parsed = diag_parse_ping(out)
+                parsed['at'] = int(time.time())
+                if code != 0 and parsed['loss_pct'] is None:
+                    tail = (err or out).strip().splitlines()
+                    parsed['error'] = tail[-1][:200] if tail else 'ping_failed'
+                results[target] = parsed
+            return results
+
+        results = await asyncio.to_thread(measure)
+
+        def apply(record):
+            record.setdefault('loss', {}).update(results)
+            return diag_state_view(record)
+
+        return diag_store.update(uid, apply)
+    finally:
+        _diag_end(key)
+
+
+@app.post('/api/servers/{server_id}/diagnostics/targets', tags=["Servers"])
+async def api_diag_targets(request: Request, server_id: int):
+    """Append a validated ping target: ``{"target": "example.com"}``."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    body = await _diag_body(request)
+    uid = _diag_uid(server, server_id)
+    raw = body.get('target')
+
+    # The read-add-write runs inside one mutate() so two parallel POSTs cannot
+    # drop each other's target.
+    def apply(record):
+        targets, error = diag_add_target(record.get('targets'), raw)
+        if error:
+            return error
+        record['targets'] = targets
+        return diag_state_view(record)
+
+    result = diag_store.update(uid, apply)
+    if isinstance(result, str):
+        return _diag_failure(result, result, 400)
+    return result
+
+
+@app.delete('/api/servers/{server_id}/diagnostics/targets', tags=["Servers"])
+async def api_diag_targets_delete(request: Request, server_id: int):
+    """Remove one ping target, or all of them: ``{"target": ...}`` / ``{"all": true}``."""
+    if not _check_admin(request):
+        return _diag_failure('forbidden', 'Forbidden', 403)
+    server = _diag_server(server_id)
+    if server is None:
+        return _diag_failure('server_not_found', 'Server not found', 404)
+    body = await _diag_body(request)
+    uid = _diag_uid(server, server_id)
+    raw = body.get('target')
+    clear_all = bool(body.get('all'))
+
+    def apply(record):
+        if clear_all:
+            record['targets'] = []
+            return diag_state_view(record)
+        targets, error = diag_remove_target(record.get('targets'), raw)
+        if error:
+            return error
+        record['targets'] = targets
+        return diag_state_view(record)
+
+    result = diag_store.update(uid, apply)
+    if isinstance(result, str):
+        return _diag_failure(result, result, 400)
+    return result
 
 if __name__ == '__main__':
     data = load_data()

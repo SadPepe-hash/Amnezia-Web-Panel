@@ -2014,6 +2014,9 @@
     <div id="serverStatus" class="srv-header__status">
         <div class="srv-header__badges" id="statusBadges"></div>
         <div class="srv-header__actions">
+            <button class="btn btn-secondary btn-sm srv-action" onclick="openDiagnostics()" id="diagnosticsBtn">
+                {{ ui_icon('activity', 15) }} <span>{{ _('diag_title') }}</span>
+            </button>
             <button class="btn btn-primary btn-sm srv-action" onclick="openMarketplaceModal()" id="marketplaceBtn">
                 {{ ui_icon('store', 15) }} <span>{{ _('marketplace') }}</span>
             </button>
@@ -2820,6 +2823,107 @@
 </div>
 
 {% include '_server_management_modal.html' %}
+
+<!-- ===== Network diagnostics modal: Speedtest + packet loss add-ons ===== -->
+<div class="modal-backdrop" id="diagnosticsModal">
+    <div class="modal diag-modal">
+        <div class="modal-header">
+            <div>
+                <h2 class="modal-title">{{ ui_icon('activity', 16) }} {{ _('diag_title') }}</h2>
+                <div class="text-muted text-sm" id="diagSubtitle"></div>
+            </div>
+            <button class="modal-close" onclick="closeModal('diagnosticsModal'); diagOnClose()">×</button>
+        </div>
+        <div class="diag-tabs" role="tablist">
+            <button class="diag-tab active" type="button" data-tab="speed" onclick="diagTab('speed')">{{ ui_icon('gauge', 14) }} {{ _('diag_speedtest_title') }}</button>
+            <button class="diag-tab" type="button" data-tab="loss" onclick="diagTab('loss')">{{ ui_icon('packet-loss', 14) }} {{ _('diag_loss_title') }}</button>
+        </div>
+
+        <div class="diag-body" id="diagTabSpeed">
+            <div class="diag-speed" id="diagSpeedLayout">
+                <div class="diag-gauge-wrap">
+                    <div class="diag-gauge" id="diagGauge">
+                        <svg viewBox="0 0 286 286" aria-hidden="true">
+                            <defs>
+                                <linearGradient id="diagArcGrad" x1="0" y1="0" x2="1" y2="1">
+                                    <stop offset="0" stop-color="var(--accent)"/>
+                                    <stop offset="1" stop-color="var(--success)"/>
+                                </linearGradient>
+                                <linearGradient id="diagNeedleGrad" x1="0" y1="1" x2="0" y2="0">
+                                    <stop offset="0" stop-color="var(--diag-needle-lo)"/>
+                                    <stop offset="0.58" stop-color="var(--diag-needle-mid)"/>
+                                    <stop offset="1" stop-color="var(--diag-needle-hi)"/>
+                                </linearGradient>
+                            </defs>
+                            <path class="diag-track" d="M 51.08 234.92 A 130 130 0 1 1 234.92 234.92"
+                                  fill="none" stroke-width="23"/>
+                            <path class="diag-arc" id="diagArc" d="M 51.08 234.92 A 130 130 0 1 1 234.92 234.92"
+                                  fill="none" stroke-width="23" stroke-linecap="butt"
+                                  stroke-dasharray="612.6" stroke-dashoffset="612.6"/>
+                            <path class="diag-needle" id="diagNeedle"
+                                  d="M 133,143 L 153,143 L 148,58 L 138,58 Z"
+                                  transform="rotate(225 143 143)"/>
+                            <g class="diag-scale" id="diagScale"></g>
+                        </svg>
+                        <div class="diag-readout">
+                            <div class="diag-gauge-val" id="diagGaugeVal">—</div>
+                            <div class="diag-gauge-lbl" id="diagGaugeLabel">{{ _('diag_download') }} · {{ _('diag_mbps') }}</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="diag-side">
+                    <div class="diag-kpi"><span>{{ ui_icon('arrow-down', 13) }} {{ _('diag_download') }}</span><b id="diagDownloadKpi">—</b></div>
+                    <div class="diag-kpi"><span>{{ ui_icon('arrow-up', 13) }} {{ _('diag_upload') }}</span><b id="diagUpload">—</b></div>
+                    <div class="diag-kpi"><span>{{ ui_icon('ping', 13) }} {{ _('diag_ping') }}</span><b id="diagPing">—</b></div>
+                    <div class="diag-kpi"><span>{{ ui_icon('activity', 13) }} {{ _('diag_jitter') }}</span><b id="diagJitter">—</b></div>
+                    <div class="diag-provider" id="diagProvider"></div>
+                    <div class="diag-actions">
+                        <button class="btn btn-primary btn-sm" type="button" id="diagRunSpeed" onclick="diagRunSpeed()">{{ ui_icon('gauge', 14) }} {{ _('diag_run_test') }}</button>
+                        <span class="text-muted text-sm" id="diagSpeedAt"></span>
+                    </div>
+                </div>
+            </div>
+            <div class="diag-install-state" id="diagInstallState" hidden>
+                <span>{{ _('diag_install_missing') }}</span>
+                <button class="btn btn-primary btn-sm" type="button" onclick="diagInstall('speedtest')">{{ _('install') }}</button>
+            </div>
+            <div class="diag-hint">{{ _('diag_license_hint') }}</div>
+        </div>
+
+        <div class="diag-body" id="diagTabLoss" hidden>
+            <div class="diag-loss-head">
+                <span>{{ _('diag_target') }}</span>
+                <span>{{ _('diag_loss_pct') }}</span>
+                <span>{{ _('diag_rtt') }}</span>
+                <span class="diag-last">{{ _('diag_when') }}</span>
+            </div>
+            <div id="diagLossRows"></div>
+            <div class="diag-loss-empty" id="diagLossEmpty" hidden>{{ _('diag_no_targets') }}</div>
+            <div class="diag-add-row">
+                <button class="diag-add" type="button" onclick="diagShowAdd()">{{ ui_icon('plus', 14) }} {{ _('diag_add_target') }}</button>
+                <button class="diag-add diag-clear" type="button" id="diagClearTargets" onclick="diagClearTargets()">{{ ui_icon('trash', 14) }} {{ _('diag_clear_targets') }}</button>
+            </div>
+            <div class="diag-add-form" id="diagAddForm" hidden>
+                <input class="form-input" id="diagTarget" placeholder="{{ _('diag_target_placeholder') }}" autocomplete="off">
+                <button class="btn btn-secondary btn-sm" type="button" onclick="diagShowAdd()">{{ _('cancel') }}</button>
+                <button class="btn btn-primary btn-sm" type="button" onclick="diagAddTarget()">{{ _('add') }}</button>
+            </div>
+            <div class="diag-actions" style="margin-top: 12px;">
+                <button class="btn btn-primary btn-sm" type="button" id="diagRunLoss" onclick="diagRunLoss()">{{ ui_icon('activity', 14) }} {{ _('diag_run_all') }}</button>
+                <span class="text-muted text-sm" id="diagLossAt"></span>
+            </div>
+            <div class="diag-hint">{{ _('diag_loss_hint') }}</div>
+        </div>
+
+        <div class="modal-footer diag-foot">
+            <span class="text-muted text-sm">{{ _('diag_footnote') }}</span>
+            <div class="flex gap-sm">
+                <button class="btn btn-secondary btn-sm" type="button" onclick="loadDiagnosticsStatus(true)">{{ _('diag_refresh') }}</button>
+                <button class="btn btn-secondary btn-sm" type="button" onclick="closeModal('diagnosticsModal'); diagOnClose()">{{ _('close') }}</button>
+            </div>
+        </div>
+    </div>
+</div>
 
 <!-- ===== Install Protocol Modal ===== -->
 <div class="modal-backdrop" id="installModal">
@@ -3822,10 +3926,13 @@
         { proto: 'rknblock', category: 'services', icon: '🌈', title: 'RKN Block (C24Be)', descKey: 'rknblock_desc' },
         { proto: 'nginx', category: 'web_servers', icon: '🌐', title: 'NGINX', descKey: 'nginx_desc' },
         { proto: 'haproxy', category: 'web_servers', icon: '⚖️', title: 'HAProxy', descKey: 'haproxy_desc' },
+        { proto: 'speedtest', category: 'diagnostics', icon: '🚀', title: 'Speedtest (Ookla)', descKey: 'diag_speedtest_desc', badge: 'NEW' },
+        { proto: 'loss', category: 'diagnostics', icon: '📉', title: 'Ping / MTR', descKey: 'diag_loss_desc' },
     ];
     const MARKETPLACE_CATEGORIES = [
         { id: 'protocols', icon: '🔐', titleKey: 'protocols' },
         { id: 'services', icon: '🛠', titleKey: 'services' },
+        { id: 'diagnostics', icon: '🩺', titleKey: 'diag_title' },
         { id: 'web_servers', icon: '🌐', titleKey: 'web_servers' },
     ];
     let currentInstallProto = 'awg';
@@ -4291,28 +4398,45 @@
                     <div class="marketplace-category-title"><span>${cat.icon}</span> ${_(cat.titleKey)}</div>
                     <div class="marketplace-grid">
                         ${apps.map(app => {
+                            const isDiag = app.category === 'diagnostics';
                             const isSmart = app.proto === 'smartroute';
                             const isRkn = app.proto === 'rknblock';
                             const isWarp = app.proto === 'warp';
                             const rknUnknown = isRkn && (!rknBlockStatus || rknBlockStatus.available === false);
                             const isHostApp = isSmart || isRkn || isWarp;
-                            const installed = isSmart ? !!(smartRouteStatus && smartRouteStatus.installed)
+                            const diagInstalled = !!app.addonInstalled;
+                            const installed = isDiag ? diagInstalled
+                                : isSmart ? !!(smartRouteStatus && smartRouteStatus.installed)
                                 : (isRkn ? !!(rknBlockStatus && rknBlockStatus.installed)
                                     : (isWarp ? warpIsInstalled()
                                         : baseInstalled(app.proto)));
-                            const canInstallAnother = installed && isMultiInstanceBase(app.proto);
+                            const canInstallAnother = !isDiag && installed && isMultiInstanceBase(app.proto);
                             // WARP is not a host-level binary: wgcf and
                             // warp0.conf live inside an AmneziaWG container, so
                             // an exit-only host has nothing to install into.
                             const warpNoTarget = isWarp && !installed && !warpHasTargetInstance();
-                            const action = isSmart
+                            const actionLabel = isDiag
+                                ? (installed ? _('diag_open') : _('install'))
+                                : (isSmart ? _('smartroute_open')
+                                    : (warpNoTarget ? _('srv_warp_no_awg')
+                                        : (canInstallAnother ? _('install_another')
+                                            : (installed ? _('installed') : _('install')))));
+                                                        const action = isDiag
+                                ? (installed
+                                    ? `onclick="closeModal('marketplaceModal'); openDiagnostics()"`
+                                    : `onclick="diagInstall('${app.proto}')"`)
+                                : isSmart
                                 ? `onclick="openSmartRouteModal()"`
                                 : (isWarp
                                     ? (installed || warpNoTarget ? 'disabled' : `onclick="closeModal('marketplaceModal'); installWarp()"`)
                                     : (isRkn
                                         ? (installed || rknUnknown ? 'disabled' : `onclick="closeModal('marketplaceModal'); installRknBlock()"`)
                                         : (installed && !canInstallAnother ? 'disabled' : `onclick="installFromMarketplace('${app.proto}', ${canInstallAnother ? 'true' : 'false'})"`)));
-                            const statusBadge = isWarp
+                            const statusBadge = isDiag
+                                ? (installed
+                                    ? `<span class="badge badge-success"><span class="badge-dot"></span> ${_('installed')}</span>`
+                                    : `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('not_installed')}</span>`)
+                                : isWarp
                                 ? (warpNoTarget
                                     ? `<span class="badge badge-warn"><span class="badge-dot"></span> ${escapeHtml(_('srv_warp_no_awg'))}</span>`
                                     : warpAggregateBadge())
@@ -4334,7 +4458,7 @@
                                     </div>
                                     <div class="marketplace-app-desc">${_(app.descKey)}</div>
                                     <button class="btn ${installed && !canInstallAnother ? 'btn-secondary' : 'btn-primary'} btn-sm" ${action}>
-                                        ${isSmart ? _('smartroute_open') : (warpNoTarget ? _('srv_warp_no_awg') : (canInstallAnother ? _('install_another') : (installed ? _('installed') : _('install'))))}
+                                        ${actionLabel}
                                     </button>
                                 </div>
                             `;
@@ -9491,5 +9615,692 @@ function openCheburcheckModal() {
 }
 
 document.addEventListener('DOMContentLoaded', loadCheburcheck);
+</script>
+<script>
+    // ===== Network diagnostics: Speedtest + packet loss add-ons =====
+    // Results come from GET /diagnostics/status; every measurement is one
+    // explicit POST, nothing is polled in the background.
+    const DIAG_API = `/api/servers/${SERVER_ID}/diagnostics`;
+    let diagStatus = null;
+    // Measurements shown in this modal belong to the current open session:
+    // every open starts from a clean slate, stored results are never replayed.
+    let diagView = {speedtest: null, loss: {}};
+    let diagTabName = 'speed';
+    let diagBusy = false;
+    let diagBusyKind = null;   // 'speedtest' | 'loss' | 'install'
+    let diagRunToken = 0;      // bumps on cancel so the poll loop exits
+    let diagOpen = false;
+
+    function diagTime(ts) {
+        if (!ts) return _('diag_never');
+        const d = new Date(ts * 1000);
+        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    }
+
+    function diagNum(value) {
+        return value === null || value === undefined ? '—' : String(value);
+    }
+
+    const DIAG_DIAL = { center: 143, radius: 130, labels: 97, start: 135, step: 33.75 };
+    const DIAG_DIAL_LENGTH = 612.6;
+    // Speedtest's dial is non-linear: nine equally spaced labels from 0 to
+    // 1000; above a gigabit the same shape is used with labels x10.
+    const DIAG_SCALES = [
+        [0, 5, 10, 50, 100, 250, 500, 750, 1000],
+        [0, 50, 100, 500, 1000, 2500, 5000, 7500, 10000],
+    ];
+    let diagScaleSet = null;
+    let diagScaleEls = [];
+
+    function diagScaleValues(value) {
+        return value > 1000 ? DIAG_SCALES[1] : DIAG_SCALES[0];
+    }
+
+    function diagAngleFor(value, labels) {
+        const top = labels[labels.length - 1];
+        const v = Math.max(0, Math.min(top, value));
+        let i = 0;
+        while (i < labels.length - 2 && v > labels[i + 1]) i += 1;
+        const span = labels[i + 1] - labels[i];
+        const frac = span > 0 ? (v - labels[i]) / span : 0;
+        return DIAG_DIAL.start + (i + frac) * DIAG_DIAL.step;
+    }
+
+    function diagBuildScale(labels) {
+        const group = document.getElementById('diagScale');
+        if (!group) return;
+        if (diagScaleSet === labels && diagScaleEls.length) return;
+        group.textContent = '';
+        diagScaleEls = labels.map((label, i) => {
+            const angle = (DIAG_DIAL.start + i * DIAG_DIAL.step) * Math.PI / 180;
+            const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            text.setAttribute('x', (DIAG_DIAL.center + Math.cos(angle) * DIAG_DIAL.labels).toFixed(1));
+            text.setAttribute('y', (DIAG_DIAL.center + Math.sin(angle) * DIAG_DIAL.labels).toFixed(1));
+            text.textContent = String(label);
+            group.appendChild(text);
+            return text;
+        });
+        diagScaleSet = labels;
+    }
+
+    function diagNeedleSet(angle) {
+        const needle = document.getElementById('diagNeedle');
+        if (needle) {
+            needle.setAttribute('transform',
+                `rotate(${((angle + 90) % 360).toFixed(2)} 143 143)`);
+        }
+    }
+
+    let diagAnimAngle = DIAG_DIAL.start;
+
+    function diagGaugeShow(value, phase, approx, dt) {
+        const labels = diagScaleValues(value);
+        diagBuildScale(labels);
+        const target = diagAngleFor(value, labels);
+        // Damped follow so noisy samples do not make the needle twitch.
+        const k = 1 - Math.exp(-Math.max(0.001, dt || 0.016) / 0.22);
+        diagAnimAngle += (target - diagAnimAngle) * k;
+        const angle = diagAnimAngle;
+        const ratio = Math.max(0, Math.min(1, (angle - DIAG_DIAL.start) / 270));
+        const box = document.getElementById('diagGaugeVal');
+        box.textContent = Math.max(0, value).toFixed(2);
+        box.style.fontSize = value >= 1000 ? '25px' : '30px';
+        box.classList.toggle('is-approx', approx);
+        document.getElementById('diagGaugeLabel').textContent =
+            `${_(phase === 'upload' ? 'diag_upload' : 'diag_download')} · ${_('diag_mbps')}`;
+        document.getElementById('diagArc').setAttribute('stroke-dashoffset',
+            (DIAG_DIAL_LENGTH * (1 - ratio)).toFixed(1));
+        diagNeedleSet(angle);
+        diagScaleEls.forEach((el, i) => el.classList.toggle('on', labels[i] <= value));
+    }
+
+    function diagGaugeSet(value, phase = 'download', approx = true) {
+        const labels = diagScaleValues(value);
+        diagBuildScale(labels);
+        const angle = diagAngleFor(value, labels);
+        diagAnimAngle = angle;
+        const ratio = (angle - DIAG_DIAL.start) / 270;
+        const box = document.getElementById('diagGaugeVal');
+        box.textContent = Math.max(0, value).toFixed(2);
+        box.style.fontSize = value >= 1000 ? '25px' : '30px';
+        box.classList.toggle('is-approx', approx);
+        document.getElementById('diagGaugeLabel').textContent =
+            `${_(phase === 'upload' ? 'diag_upload' : 'diag_download')} · ${_('diag_mbps')}`;
+        document.getElementById('diagArc').setAttribute('stroke-dashoffset',
+            (DIAG_DIAL_LENGTH * (1 - ratio)).toFixed(1));
+        diagNeedleSet(angle);
+        diagScaleEls.forEach((el, i) => el.classList.toggle('on', labels[i] <= value));
+    }
+
+    function diagGaugeReset() {
+        const labels = DIAG_SCALES[0];
+        diagBuildScale(labels);
+        const box = document.getElementById('diagGaugeVal');
+        box.textContent = '—';
+        box.style.fontSize = '30px';
+        box.classList.remove('is-approx');
+        document.getElementById('diagGaugeLabel').textContent =
+            `${_('diag_download')} · ${_('diag_mbps')}`;
+        document.getElementById('diagArc').setAttribute('stroke-dashoffset', String(DIAG_DIAL_LENGTH));
+        diagAnimAngle = DIAG_DIAL.start;
+        diagNeedleSet(DIAG_DIAL.start);
+        diagScaleEls.forEach(el => el.classList.remove('on'));
+    }
+
+    function diagKpiSet(id, value, unitKey, digits) {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = `${value.toFixed(digits)} <small>${_(unitKey)}</small>`;
+    }
+
+    function diagKpiReset(id) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = '—';
+    }
+
+    // The host streams JSONL progress; the page polls it and feeds the gauge
+    // real download/upload numbers, so the needle never invents values.
+    let diagLive = null;
+    let diagLastState = null;
+
+    function diagLiveStart() {
+        diagLiveStop();
+        diagBuildScale(DIAG_SCALES[0]);
+        diagGaugeReset();
+        const wrap = document.querySelector('.diag-gauge-wrap');
+        if (wrap) wrap.classList.add('is-running');
+        diagKpiReset('diagDownloadKpi');
+        diagKpiReset('diagUpload');
+        diagKpiReset('diagPing');
+        diagKpiReset('diagJitter');
+        diagAnimAngle = DIAG_DIAL.start;
+        diagLive = {raf: 0, target: 0, phase: 'ping', download: 0, upload: 0,
+                    ping: 0, jitter: 0};
+        let prev = performance.now();
+        const frame = now => {
+            if (!diagLive) return;
+            const dt = Math.min(0.2, Math.max(0.008, (now - prev) / 1000));
+            prev = now;
+            diagGaugeShow(diagLive.target, diagLive.phase, false, dt);
+            diagLive.raf = requestAnimationFrame(frame);
+        };
+        diagLive.raf = requestAnimationFrame(frame);
+    }
+
+    function diagLiveApply(state) {
+        if (!diagLive) diagLiveStart();
+        diagLastState = state;
+        const phase = state.phase === 'upload' ? 'upload'
+            : (state.phase === 'ping' ? 'ping' : 'download');
+        diagLive.phase = phase;
+        if (state.download_mbps !== undefined && state.download_mbps !== null) {
+            diagLive.download = state.download_mbps;
+            if (phase !== 'upload') diagLive.target = state.download_mbps;
+        }
+        if (state.upload_mbps !== undefined && state.upload_mbps !== null) {
+            diagLive.upload = state.upload_mbps;
+            if (phase === 'upload') diagLive.target = state.upload_mbps;
+        }
+        if (state.ping_ms !== undefined && state.ping_ms !== null) {
+            diagLive.ping = state.ping_ms;
+            diagKpiSet('diagPing', state.ping_ms, 'diag_ms', 1);
+        }
+        if (state.jitter_ms !== undefined && state.jitter_ms !== null) {
+            diagLive.jitter = state.jitter_ms;
+            diagKpiSet('diagJitter', state.jitter_ms, 'diag_ms', 1);
+        }
+        if (diagLive.download) {
+            diagKpiSet('diagDownloadKpi', diagLive.download, 'diag_mbps', 1);
+        }
+        if (phase === 'upload' && diagLive.upload) {
+            diagKpiSet('diagUpload', diagLive.upload, 'diag_mbps', 1);
+        }
+        document.getElementById('diagProvider').textContent =
+            (phase === 'ping' ? _('diag_ping')
+                : (phase === 'download' ? _('diag_download') : _('diag_upload'))) + '…';
+    }
+
+    function diagLiveStop() {
+        if (diagLive) {
+            cancelAnimationFrame(diagLive.raf);
+            diagLive = null;
+        }
+        const wrap = document.querySelector('.diag-gauge-wrap');
+        if (wrap) wrap.classList.remove('is-running');
+    }
+
+    async function diagCancelSpeedtest() {
+        diagRunToken += 1;
+        diagLiveStop();
+        try {
+            await apiCall(DIAG_API + '/speedtest/cancel', 'POST', {});
+        } catch (e) {
+            // Cancel is best effort: the server also times the run out.
+        }
+    }
+
+    function diagOnClose() {
+        diagOpen = false;
+        if (!diagBusy) return;
+        if (diagBusyKind === 'speedtest') {
+            diagCancelSpeedtest();
+        } else {
+            diagLiveStop();
+        }
+    }
+
+    // Any close path (×, "Закрыть", backdrop click, Escape) lands here.
+    const diagModalEl = document.getElementById('diagnosticsModal');
+    if (diagModalEl && window.MutationObserver) {
+        new MutationObserver(() => {
+            const open = diagModalEl.classList.contains('active');
+            if (!open && diagOpen) diagOnClose();
+        }).observe(diagModalEl, {attributes: true, attributeFilter: ['class']});
+    }
+
+    function diagSettle(speed) {
+        const live = diagLive;
+        diagLiveStop();
+        if (!speed) {
+            renderDiagnostics();
+            return;
+        }
+        const fromDl = live && live.download ? live.download : 0;
+        const fromUl = live && live.upload ? live.upload : 0;
+        const fromPing = live && live.ping ? live.ping : 0;
+        const fromJitter = live && live.jitter ? live.jitter : 0;
+        const started = performance.now();
+        const duration = 700;
+        const step = now => {
+            const k = Math.min(1, (now - started) / duration);
+            const ease = 1 - Math.pow(1 - k, 3);
+            diagGaugeSet(fromDl + (speed.download_mbps - fromDl) * ease, 'download', false);
+            diagKpiSet('diagDownloadKpi', fromDl + (speed.download_mbps - fromDl) * ease,
+                'diag_mbps', 1);
+            diagKpiSet('diagUpload', fromUl + (speed.upload_mbps - fromUl) * ease,
+                'diag_mbps', 1);
+            diagKpiSet('diagPing', fromPing + (speed.ping_ms - fromPing) * ease, 'diag_ms', 1);
+            diagKpiSet('diagJitter', fromJitter + (speed.jitter_ms - fromJitter) * ease,
+                'diag_ms', 1);
+            if (k < 1) requestAnimationFrame(step); else renderDiagnostics();
+        };
+        requestAnimationFrame(step);
+    }
+
+    function diagAppInstalled(name) {
+        return !!(diagStatus && (diagStatus.apps || {})[name]
+            && diagStatus.apps[name].installed);
+    }
+
+    function diagTab(name) {
+        diagTabName = name;
+        document.querySelectorAll('.diag-tab').forEach(tab => {
+            tab.classList.toggle('active', tab.dataset.tab === name);
+        });
+        document.getElementById('diagTabSpeed').hidden = name !== 'speed';
+        document.getElementById('diagTabLoss').hidden = name !== 'loss';
+    }
+
+    function openDiagnostics() {
+        diagOpen = true;
+        if (!diagBusy) {
+            diagView = {speedtest: null, loss: {}};
+        }
+        diagTabName = 'speed';
+        diagBuildScale(DIAG_SCALES[0]);
+        document.getElementById('diagSubtitle').textContent =
+            [{{ server.name | tojson }}, {{ server.host | tojson }}].filter(Boolean).join(' · ');
+        diagTab(diagTabName);
+        renderDiagnostics();
+        openModal('diagnosticsModal');
+        if (diagBusy) {
+            diagLiveStart();
+            if (diagLastState) diagLiveApply(diagLastState);
+        }
+        loadDiagnosticsStatus();
+    }
+
+    function applyDiagStatus(view) {
+        diagStatus = view || {};
+        // The marketplace renders from the app list; keep its install flags in
+        // sync without a second global the marketplace code would depend on.
+        MARKETPLACE_APPS.forEach(app => {
+            if (app.category === 'diagnostics') {
+                app.addonInstalled = !!(view && (view.apps || {})[app.proto]
+                    && view.apps[app.proto].installed);
+            }
+        });
+    }
+
+    async function loadDiagnosticsStatus(probe = false, autoProbe = true) {
+        try {
+            applyDiagStatus(await apiCall(DIAG_API + (probe ? '/probe' : '/status'),
+                probe ? 'POST' : 'GET', probe ? {} : null));
+        } catch (e) {
+            showToast(e.message, 'error');
+            return;
+        }
+        // First open of the diagnostics modal: ask the host once what is
+        // present. The marketplace only reads the store, never SSH.
+        if (!probe && autoProbe && diagStatus && !Object.keys(diagStatus.apps || {}).length) {
+            return loadDiagnosticsStatus(true);
+        }
+        renderDiagnostics();
+        return diagStatus;
+    }
+
+    function renderDiagnostics() {
+        const state = diagStatus || {};
+        const speed = diagView.speedtest;
+        const missing = !!(state.apps && state.apps.speedtest) && !diagAppInstalled('speedtest');
+        document.getElementById('diagSpeedLayout').hidden = missing;
+        document.getElementById('diagInstallState').hidden = !missing;
+
+        const download = speed ? speed.download_mbps : null;
+        if (download === null || download === undefined) {
+            diagGaugeReset();
+        } else {
+            diagGaugeSet(download, 'download', false);
+        }
+        document.getElementById('diagDownloadKpi').innerHTML = speed
+            ? `${diagNum(speed.download_mbps)} <small>${_('diag_mbps')}</small>` : '—';
+        document.getElementById('diagUpload').innerHTML = speed
+            ? `${diagNum(speed.upload_mbps)} <small>${_('diag_mbps')}</small>` : '—';
+        document.getElementById('diagPing').innerHTML = speed
+            ? `${diagNum(speed.ping_ms)} <small>${_('diag_ms')}</small>` : '—';
+        document.getElementById('diagJitter').innerHTML = speed
+            ? `${diagNum(speed.jitter_ms)} <small>${_('diag_ms')}</small>` : '—';
+        document.getElementById('diagProvider').textContent = speed
+            ? [speed.isp, speed.server].filter(Boolean).join(' · ')
+            : _('diag_not_measured');
+        document.getElementById('diagSpeedAt').textContent = speed
+            ? _('diag_last_check') + ': ' + diagTime(speed.at) : '';
+
+        const rows = document.getElementById('diagLossRows');
+        rows.textContent = '';
+        const loss = diagView.loss || {};
+        (state.targets || []).forEach(target => {
+            const item = loss[target] || {};
+            const value = item.loss_pct;
+            const cls = value === null || value === undefined ? ''
+                : (value <= 0 ? 'ok' : (value < 5 ? 'warn' : 'dan'));
+            const row = document.createElement('div');
+            row.className = 'diag-loss-row';
+            const name = document.createElement('span');
+            name.className = 'mono';
+            name.textContent = target;
+            const pct = document.createElement('span');
+            pct.className = 'diag-pct ' + cls;
+            pct.textContent = value === null || value === undefined ? '—' : `${value}%`;
+            const rtt = document.createElement('span');
+            rtt.className = 'diag-rtt mono';
+            rtt.textContent = item.rtt_avg === null || item.rtt_avg === undefined
+                ? '—' : `${item.rtt_min} / ${item.rtt_avg} / ${item.rtt_max} ${_('diag_ms')}`;
+            const when = document.createElement('span');
+            when.className = 'diag-last mono';
+            when.textContent = item.at ? diagTime(item.at) : '—';
+            const drop = document.createElement('button');
+            drop.type = 'button';
+            drop.className = 'diag-target-del';
+            drop.title = _('diag_remove_target');
+            drop.setAttribute('aria-label', _('diag_remove_target'));
+            drop.innerHTML = '✕';
+            drop.addEventListener('click', () => diagRemoveTarget(target));
+            row.append(name, pct, rtt, when, drop);
+            rows.appendChild(row);
+        });
+        const targets = state.targets || [];
+        document.getElementById('diagLossEmpty').hidden = targets.length > 0;
+        document.getElementById('diagClearTargets').hidden = targets.length === 0;
+        document.getElementById('diagRunLoss').disabled = targets.length === 0;
+        const last = Object.values(loss).reduce((max, item) => Math.max(max, item.at || 0), 0);
+        document.getElementById('diagLossAt').textContent = last
+            ? _('diag_last_check') + ': ' + diagTime(last) : '';
+    }
+
+    function diagSetBusy(button, busy) {
+        diagBusy = busy;
+        if (!button) return;
+        button.disabled = busy;
+        if (busy) {
+            button.dataset.label = button.innerHTML;
+            button.innerHTML = '⟳ ' + _('diag_measuring');
+        } else if (button.dataset.label) {
+            button.innerHTML = button.dataset.label;
+        }
+    }
+
+    async function diagRunSpeed() {
+        if (diagBusy) return;
+        const button = document.getElementById('diagRunSpeed');
+        diagSetBusy(button, true);
+        diagBusyKind = 'speedtest';
+        const token = ++diagRunToken;
+        diagView.speedtest = null;
+        diagLiveStart();
+        try {
+            await apiCall(DIAG_API + '/speedtest/start', 'POST', {});
+            const deadline = Date.now() + 240000;
+            while (Date.now() < deadline) {
+                await new Promise(resolve => setTimeout(resolve, 600));
+                if (token !== diagRunToken) return;   // modal closed / canceled
+                const state = await apiCall(DIAG_API + '/speedtest/progress', 'GET', null);
+                if (state.state === 'running') {
+                    diagLiveApply(state);
+                    continue;
+                }
+                if (state.state === 'done' && state.result) {
+                    diagView.speedtest = state.result;
+                    diagSettle(state.result);
+                    showToast(_('diag_done'), 'success');
+                    return;
+                }
+                throw new Error(_('diag_speedtest_failed'));
+            }
+            throw new Error(_('diag_speedtest_failed'));
+        } catch (e) {
+            if (token !== diagRunToken) return;       // canceled, stay quiet
+            diagLiveStop();
+            renderDiagnostics();
+            const code = e.payload && e.payload.code;
+            if (code === 'not_installed') {
+                await loadDiagnosticsStatus(true);
+            }
+            showToast(code === 'speedtest_unreachable'
+                ? _('diag_speedtest_unreachable')
+                : (code === 'speedtest_failed' ? _('diag_speedtest_failed') : e.message),
+                'error');
+        } finally {
+            if (diagBusyKind === 'speedtest') diagBusyKind = null;
+            diagSetBusy(button, false);
+        }
+    }
+
+    async function diagRunLoss() {
+        if (diagBusy) return;
+        const button = document.getElementById('diagRunLoss');
+        diagSetBusy(button, true);
+        diagBusyKind = 'loss';
+        try {
+            applyDiagStatus(await apiCall(DIAG_API + '/loss', 'POST', {}));
+            diagView.loss = {...(diagStatus.loss || {})};
+            renderDiagnostics();
+            showToast(_('diag_done'), 'success');
+        } catch (e) {
+            showToast(e.message, 'error');
+        } finally {
+            if (diagBusyKind === 'loss') diagBusyKind = null;
+            diagSetBusy(button, false);
+        }
+    }
+
+    async function diagInstall(app) {
+        if (diagBusy) return;
+        diagBusy = true;
+        diagBusyKind = 'install';
+        showToast(_('diag_installing'), 'info');
+        try {
+            applyDiagStatus(await apiCall(DIAG_API + '/install', 'POST', {app}));
+            renderDiagnostics();
+            renderMarketplace();
+            showToast(_('installed'), 'success');
+        } catch (e) {
+            showToast(e.message, 'error');
+        } finally {
+            diagBusy = false;
+            diagBusyKind = null;
+        }
+    }
+
+    function diagShowAdd() {
+        const form = document.getElementById('diagAddForm');
+        form.hidden = !form.hidden;
+        if (!form.hidden) document.getElementById('diagTarget').focus();
+    }
+
+    async function diagRemoveTarget(target) {
+        try {
+            diagStatus = await apiCall(DIAG_API + '/targets', 'DELETE', {target});
+            if (diagView.loss) delete diagView.loss[target];
+            renderDiagnostics();
+            renderMarketplace();
+        } catch (e) {
+            const code = e.payload && e.payload.code;
+            showToast(code === 'target_not_found' ? _('diag_target_not_found') : e.message,
+                'error');
+        }
+    }
+
+    async function diagClearTargets() {
+        try {
+            diagStatus = await apiCall(DIAG_API + '/targets', 'DELETE', {all: true});
+            diagView.loss = {};
+            renderDiagnostics();
+            renderMarketplace();
+        } catch (e) {
+            showToast(e.message, 'error');
+        }
+    }
+
+    async function diagAddTarget() {
+        const input = document.getElementById('diagTarget');
+        const target = (input.value || '').trim();
+        if (!target) return;
+        try {
+            diagStatus = await apiCall(DIAG_API + '/targets', 'POST', {target});
+            input.value = '';
+            document.getElementById('diagAddForm').hidden = true;
+            renderDiagnostics();
+        } catch (e) {
+            const code = e.payload && e.payload.code;
+            const messages = {
+                invalid_target: 'diag_invalid_target',
+                duplicate_target: 'diag_duplicate_target',
+                too_many_targets: 'diag_too_many_targets',
+            };
+            showToast(messages[code] ? _(messages[code]) : e.message, 'error');
+        }
+    }
+
+    function setInstalledAppsLoading(isLoading) {
+        installedAppsLoading = !!isLoading;
+        const loading = document.getElementById('installedAppsLoading');
+        const empty = document.getElementById('installedAppsEmpty');
+        const grid = document.getElementById('protocols-grid');
+        if (loading) loading.classList.toggle('hidden', !installedAppsLoading);
+        if (empty && installedAppsLoading) empty.classList.add('hidden');
+        if (grid) grid.classList.toggle('apps-pending', installedAppsLoading);
+    }
+
+    function applyInstalledAppsVisibility() {
+        let installedCount = 0;
+        const grid = document.getElementById('protocols-grid');
+        const order = new Map(MARKETPLACE_APPS.map((app, idx) => [app.proto, idx]));
+
+        Object.entries(currentProtocolStatus || {}).forEach(([proto, info]) => {
+            if (isAppInstalled(info)) installedCount++;
+        });
+
+        // Hide every static card first. This prevents stale service cards
+        // (SOCKS5/DNS/AdGuard/etc.) from staying visible when they are not
+        // reported as installed by the backend.
+        document.querySelectorAll('.protocol-card[id^="proto-"]').forEach(card => {
+            card.classList.add('installed-app-hidden');
+            card.classList.remove('installed-app-visible');
+        });
+
+        MARKETPLACE_APPS.forEach(app => {
+            const card = document.getElementById(`proto-${protoDomKey(app.proto)}`);
+            // Show the base card only when the BASE instance itself is
+            // installed. Family visibility (any awg2__N installed) used to
+            // keep a deleted base card on screen as "not installed / install"
+            // — a phantom instance right after uninstall. Extra instances
+            // render their own dynamic cards (ensureProtocolCard) below.
+            // Smart Route is host-level (no container status): its card is
+            // driven by smartRouteStatus further below.
+            if (app.proto === 'smartroute') return;
+            // RKN Block is host-level (no container status): its card is
+            // driven by rknBlockStatus further below.
+            if (app.proto === 'rknblock') return;
+            // Cloudflare WARP is host-level too: its card is driven by
+            // warpIsInstalled() further below, not by container status.
+            if (app.proto === 'warp') return;
+            const installed = isAppInstalled((currentProtocolStatus || {})[app.proto]);
+            if (card) {
+                card.classList.toggle('installed-app-hidden', !installed);
+                card.classList.toggle('installed-app-visible', installed);
+            }
+        });
+
+        // Smart Route card: host-level app, installed-state comes from the
+        // smartroute status endpoint rather than the protocol check.
+        const srInstalled = !!(smartRouteStatus && smartRouteStatus.installed);
+        const srCard = document.getElementById('proto-smartroute');
+        if (srCard) {
+            srCard.classList.toggle('installed-app-hidden', !srInstalled);
+            srCard.classList.toggle('installed-app-visible', srInstalled);
+        }
+        if (srInstalled) installedCount++;
+        renderSmartRouteCard();
+
+        // RKN Block card: host-level app, installed-state comes from the
+        // rkn_scans endpoint (server['rknblock']) rather than protocol check.
+        const rknInstalled = !!(rknBlockStatus && rknBlockStatus.installed);
+        const rknCard = document.getElementById('proto-rknblock');
+        if (rknCard) {
+            rknCard.classList.toggle('installed-app-hidden', !rknInstalled);
+            rknCard.classList.toggle('installed-app-visible', rknInstalled);
+        }
+        if (rknInstalled) installedCount++;
+        renderRknBlockCard();
+
+        // Cloudflare WARP card: host-level app. It is shown only once WARP is
+        // installed; before that the marketplace is the entry point.
+        const warpInstalled = warpIsInstalled();
+        const warpCard = document.getElementById('proto-warp');
+        if (warpCard) {
+            warpCard.classList.toggle('installed-app-hidden', !warpInstalled);
+            warpCard.classList.toggle('installed-app-visible', warpInstalled);
+        }
+        if (warpInstalled) installedCount++;
+        if (typeof renderWarpCard === 'function') renderWarpCard();
+
+        orderedProtocolEntries(currentProtocolStatus || {}).forEach(([proto, info]) => {
+            if (protoInstance(proto) > 1) {
+                ensureProtocolCard(proto);
+                const card = document.getElementById(`proto-${protoDomKey(proto)}`);
+                const installed = isAppInstalled(info);
+                if (card) {
+                    card.classList.toggle('installed-app-hidden', !installed);
+                    card.classList.toggle('installed-app-visible', installed);
+                }
+            }
+        });
+
+        // Keep all installed cards in one compact ordered grid. Without this,
+        // services that were originally in another section (NGINX/SOCKS5/DNS/
+        // AdGuard) appear with a visual offset below VPN protocols.
+        if (grid) {
+            Array.from(document.querySelectorAll('.protocol-card.installed-app-visible[id^="proto-"]'))
+                .sort((a, b) => {
+                    const ap = (a.id || '').replace(/^proto-/, '').replace(/-/g, '_');
+                    const bp = (b.id || '').replace(/^proto-/, '').replace(/-/g, '_');
+                    const ao = order.has(protoBase(ap)) ? order.get(protoBase(ap)) : 999;
+                    const bo = order.has(protoBase(bp)) ? order.get(protoBase(bp)) : 999;
+                    if (ao !== bo) return ao - bo;
+                    return protoInstance(ap) - protoInstance(bp);
+                })
+                .forEach(card => grid.appendChild(card));
+        }
+
+        const empty = document.getElementById('installedAppsEmpty');
+        if (empty) empty.classList.toggle('hidden', installedAppsLoading || installedCount > 0);
+        const loading = document.getElementById('installedAppsLoading');
+        if (loading) loading.classList.toggle('hidden', !installedAppsLoading);
+        if (grid) grid.classList.toggle('apps-pending', installedAppsLoading);
+        applyCustomTitles();
+    }
+
+    function getProtoTitle(proto) {
+        if (CUSTOM_PROTO_NAMES[proto]) return CUSTOM_PROTO_NAMES[proto];
+        const base = protoBase(proto);
+        const idx = protoInstance(proto);
+        if (PROTOCOL_LABELS[proto]) return PROTOCOL_LABELS[proto];
+        const title = DEFAULT_PROTOCOL_LABELS[base] || base;
+        return idx > 1 ? `${title} #${idx}` : title;
+    }
+
+    // Apply custom instance names to the visible card titles (static cards
+    // keep hardcoded names in HTML, so they need an explicit override).
+    function applyCustomTitles() {
+        Object.entries(CUSTOM_PROTO_NAMES).forEach(([proto, name]) => {
+            const card = document.getElementById(`proto-${protoDomKey(proto)}`);
+            const nameEl = card && card.querySelector('.protocol-name');
+            if (nameEl) {
+                const pencil = nameEl.querySelector('.proto-rename');
+                nameEl.textContent = name;
+                if (pencil) nameEl.appendChild(pencil);
+            }
+        });
+    }
 </script>
 {% endblock %}
